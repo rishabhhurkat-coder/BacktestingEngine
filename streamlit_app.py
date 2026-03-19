@@ -1176,6 +1176,8 @@ def style_saved_signals_table(
 
 def main() -> None:
     st.set_page_config(page_title="EMA Trade Viewer", layout="wide")
+    is_windows = sys.platform.startswith("win")
+    cloud_workspace_dir = BASE_DIR / "workspace_template"
 
     st.session_state.setdefault("saved_signals", [])
     st.session_state.setdefault("latest_signal", None)
@@ -1205,6 +1207,14 @@ def main() -> None:
     st.session_state.setdefault("filter_data_dir", None)
     st.session_state.setdefault("filter_output_dir", None)
     st.session_state.setdefault("selected_symbol", None)
+    if (
+        not st.session_state.main_dir_path_input
+        and not is_windows
+        and cloud_workspace_dir.exists()
+    ):
+        st.session_state.main_dir_path_input = str(cloud_workspace_dir)
+        st.session_state.data_dir_path_input = str(cloud_workspace_dir / "Input Files")
+        st.session_state.output_dir_path_input = str(cloud_workspace_dir / "Output Files")
 
     st.markdown(
         f"""
@@ -1334,15 +1344,18 @@ def main() -> None:
             st.header("Filters")
             st.caption(f"Timeframe: {TIMEFRAME_TEXT}")
             st.caption("Session: 09:15 - 15:27")
-            if st.button("Main Folder", use_container_width=True):
-                selected_folder = browse_for_folder(st.session_state.main_dir_path_input)
-                if selected_folder:
-                    selected_main_dir = resolve_data_dir(selected_folder)
-                    st.session_state.main_dir_path_input = str(selected_main_dir)
-                    st.session_state.data_dir_path_input = str(selected_main_dir / "Input Files")
-                    st.session_state.output_dir_path_input = str(selected_main_dir / "Output Files")
-                    st.session_state.selected_symbol = None
-                    st.rerun()
+            if is_windows:
+                if st.button("Main Folder", use_container_width=True):
+                    selected_folder = browse_for_folder(st.session_state.main_dir_path_input)
+                    if selected_folder:
+                        selected_main_dir = resolve_data_dir(selected_folder)
+                        st.session_state.main_dir_path_input = str(selected_main_dir)
+                        st.session_state.data_dir_path_input = str(selected_main_dir / "Input Files")
+                        st.session_state.output_dir_path_input = str(selected_main_dir / "Output Files")
+                        st.session_state.selected_symbol = None
+                        st.rerun()
+            else:
+                st.info("Cloud mode uses the repo workspace folder. Put CSV files into `workspace_template/Raw Files`, `Input Files`, and `Output Files` in the repo.")
 
             if st.button("Process Input Files", use_container_width=True):
                 selected_main_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
