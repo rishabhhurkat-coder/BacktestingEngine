@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 import tempfile
 from typing import Any
+from uuid import uuid4
 
 import pandas as pd
 import streamlit as st
@@ -401,6 +402,45 @@ def can_write_to_directory(folder: Path) -> bool:
     except Exception:
         return False
     return True
+
+
+def ensure_workspace_dirs(main_dir: Path) -> tuple[Path, Path, Path]:
+    raw_dir = main_dir / "Raw Files"
+    input_dir = main_dir / "Input Files"
+    output_dir = main_dir / "Output Files"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    input_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return raw_dir, input_dir, output_dir
+
+
+def clear_csv_files(folder: Path) -> None:
+    for csv_path in folder.glob("*.csv"):
+        try:
+            csv_path.unlink()
+        except OSError:
+            continue
+
+
+def build_upload_signature(uploaded_files: list[Any]) -> tuple[tuple[str, int], ...]:
+    signature: list[tuple[str, int]] = []
+    for uploaded_file in uploaded_files:
+        file_size = getattr(uploaded_file, "size", None)
+        signature.append((str(uploaded_file.name), int(file_size or 0)))
+    return tuple(sorted(signature))
+
+
+def sync_uploaded_raw_files(uploaded_files: list[Any], main_dir: Path) -> tuple[str, str]:
+    raw_dir, input_dir, _ = ensure_workspace_dirs(main_dir)
+    clear_csv_files(raw_dir)
+    clear_csv_files(input_dir)
+
+    for uploaded_file in uploaded_files:
+        target_path = raw_dir / Path(str(uploaded_file.name)).name
+        target_path.write_bytes(uploaded_file.getbuffer())
+
+    summary = process_raw_folder(raw_dir, input_dir)
+    return build_processing_feedback(summary)
 
 
 def build_processing_feedback(summary) -> tuple[str, str]:
@@ -1177,7 +1217,7 @@ def style_saved_signals_table(
 def main() -> None:
     st.set_page_config(page_title="EMA Trade Viewer", layout="wide")
     is_windows = sys.platform.startswith("win")
-    cloud_workspace_dir = BASE_DIR / "workspace_template"
+    cloud_workspace_root = Path(tempfile.gettempdir()) / "ema_trade_viewer_uploads"
 
     st.session_state.setdefault("saved_signals", [])
     st.session_state.setdefault("latest_signal", None)
@@ -1207,11 +1247,14 @@ def main() -> None:
     st.session_state.setdefault("filter_data_dir", None)
     st.session_state.setdefault("filter_output_dir", None)
     st.session_state.setdefault("selected_symbol", None)
+    st.session_state.setdefault("cloud_workspace_session_id", str(uuid4()))
+    st.session_state.setdefault("cloud_raw_upload_signature", ())
+    cloud_workspace_dir = cloud_workspace_root / st.session_state.cloud_workspace_session_id
     if (
         not st.session_state.main_dir_path_input
         and not is_windows
-        and cloud_workspace_dir.exists()
     ):
+        ensure_workspace_dirs(cloud_workspace_dir)
         st.session_state.main_dir_path_input = str(cloud_workspace_dir)
         st.session_state.data_dir_path_input = str(cloud_workspace_dir / "Input Files")
         st.session_state.output_dir_path_input = str(cloud_workspace_dir / "Output Files")
@@ -1355,7 +1398,27 @@ def main() -> None:
                         st.session_state.selected_symbol = None
                         st.rerun()
             else:
-                st.info("Cloud mode uses the repo workspace folder. Put CSV files into `workspace_template/Raw Files`, `Input Files`, and `Output Files` in the repo.")
+                st.info("Upload CSV files from your computer here. The app will create a private working folder for this browser session.")
+                uploaded_raw_files = st.file_uploader(
+                    "Upload Raw CSV Files",
+                    type="csv",
+                    accept_multiple_files=True,
+                    key="cloud_raw_uploads",
+                )
+                if uploaded_raw_files:
+                    current_upload_signature = build_upload_signature(uploaded_raw_files)
+                    if current_upload_signature != st.session_state.cloud_raw_upload_signature:
+                        level, message = sync_uploaded_raw_files(uploaded_raw_files, cloud_workspace_dir)
+                        st.session_state.cloud_raw_upload_signature = current_upload_signature
+                        st.session_state.process_feedback_level = level
+                        st.session_state.process_feedback_message = message
+                        st.session_state.main_dir_path_input = str(cloud_workspace_dir)
+                        st.session_state.data_dir_path_input = str(cloud_workspace_dir / "Input Files")
+                        st.session_state.output_dir_path_input = str(cloud_workspace_dir / "Output Files")
+                        st.session_state.selected_symbol = None
+                        list_symbols.clear()
+                        load_data.clear()
+                        st.rerun()
 
             if st.button("Process Input Files", use_container_width=True):
                 selected_main_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
@@ -1455,7 +1518,10 @@ def main() -> None:
         if raw_symbols:
             st.error("No processed CSV files found in Input Files. Click Process Input Files.")
         else:
-            st.error(f"No raw CSV files found in {raw_dir}")
+            if is_windows:
+                st.error(f"No raw CSV files found in {raw_dir}")
+            else:
+                st.info("Upload raw CSV files from your computer to begin.")
         return
 
     symbol_names = list(symbols.keys())
