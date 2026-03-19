@@ -575,6 +575,61 @@ def read_file_bytes(file_path: Path) -> bytes | None:
     return file_path.read_bytes()
 
 
+@st.dialog("Upload Files", width="large")
+def render_cloud_upload_dialog(main_dir: Path) -> None:
+    st.caption("Upload any combination of raw, input, and output folders.")
+    uploaded_raw_files = st.file_uploader(
+        "Upload Raw Files Folder",
+        type="csv",
+        accept_multiple_files="directory",
+        key=f"cloud_raw_uploads_{st.session_state.cloud_uploader_nonce}",
+    )
+    uploaded_input_files = st.file_uploader(
+        "Upload Input Files Folder",
+        type="csv",
+        accept_multiple_files="directory",
+        key=f"cloud_input_uploads_{st.session_state.cloud_input_uploader_nonce}",
+    )
+    uploaded_output_files = st.file_uploader(
+        "Upload Output Files Folder",
+        type="csv",
+        accept_multiple_files="directory",
+        key=f"cloud_output_uploads_{st.session_state.cloud_output_uploader_nonce}",
+    )
+
+    process_choice = "No"
+    if uploaded_input_files:
+        process_choice = st.radio(
+            "Process raw files and merge with uploaded input files?",
+            ["No", "Yes"],
+            horizontal=True,
+            key="cloud_process_choice",
+        )
+
+    action_col, cancel_col = st.columns(2, gap="small")
+    with action_col:
+        if st.button("Use Uploaded Files", use_container_width=True):
+            with st.spinner("Applying uploaded files..."):
+                level, message = process_cloud_uploaded_files(
+                    uploaded_raw_files=uploaded_raw_files or [],
+                    uploaded_input_files=uploaded_input_files or [],
+                    uploaded_output_files=uploaded_output_files or [],
+                    process_uploaded_input=(process_choice == "Yes"),
+                    main_dir=main_dir,
+                )
+            st.session_state.process_feedback_level = level
+            st.session_state.process_feedback_message = message
+            st.session_state.selected_symbol = None
+            st.session_state.show_upload_dialog = False
+            list_symbols.clear()
+            load_data.clear()
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state.show_upload_dialog = False
+            st.rerun()
+
+
 def build_processing_feedback(summary) -> tuple[str, str]:
     parts: list[str] = []
     if summary.processed:
@@ -1384,6 +1439,7 @@ def main() -> None:
     st.session_state.setdefault("cloud_uploader_nonce", 0)
     st.session_state.setdefault("cloud_input_uploader_nonce", 0)
     st.session_state.setdefault("cloud_output_uploader_nonce", 0)
+    st.session_state.setdefault("show_upload_dialog", False)
     cloud_workspace_dir = cloud_workspace_root / st.session_state.cloud_workspace_session_id
     if (
         not st.session_state.main_dir_path_input
@@ -1541,50 +1597,9 @@ def main() -> None:
                 if has_processed_input_files:
                     st.success("Files are ready for this browser session.")
 
-                with st.popover("Upload Files"):
-                    st.caption("Upload any combination of raw, input, and output folders.")
-                    uploaded_raw_files = st.file_uploader(
-                        "Upload Raw Files Folder",
-                        type="csv",
-                        accept_multiple_files="directory",
-                        key=f"cloud_raw_uploads_{st.session_state.cloud_uploader_nonce}",
-                    )
-                    uploaded_input_files = st.file_uploader(
-                        "Upload Input Files Folder",
-                        type="csv",
-                        accept_multiple_files="directory",
-                        key=f"cloud_input_uploads_{st.session_state.cloud_input_uploader_nonce}",
-                    )
-                    uploaded_output_files = st.file_uploader(
-                        "Upload Output Files Folder",
-                        type="csv",
-                        accept_multiple_files="directory",
-                        key=f"cloud_output_uploads_{st.session_state.cloud_output_uploader_nonce}",
-                    )
-                    process_choice = "No"
-                    if uploaded_input_files:
-                        process_choice = st.radio(
-                            "Process raw files and merge with uploaded input files?",
-                            ["No", "Yes"],
-                            horizontal=True,
-                            key="cloud_process_choice",
-                        )
-
-                    if st.button("Use Uploaded Files", use_container_width=True):
-                        with st.spinner("Applying uploaded files..."):
-                            level, message = process_cloud_uploaded_files(
-                                uploaded_raw_files=uploaded_raw_files or [],
-                                uploaded_input_files=uploaded_input_files or [],
-                                uploaded_output_files=uploaded_output_files or [],
-                                process_uploaded_input=(process_choice == "Yes"),
-                                main_dir=cloud_workspace_dir,
-                            )
-                        st.session_state.process_feedback_level = level
-                        st.session_state.process_feedback_message = message
-                        st.session_state.selected_symbol = None
-                        list_symbols.clear()
-                        load_data.clear()
-                        st.rerun()
+                if st.button("Upload Files", use_container_width=True):
+                    st.session_state.show_upload_dialog = True
+                    st.rerun()
 
                 if st.button("Reset Uploaded Files", use_container_width=True):
                     clear_csv_files(raw_dir)
@@ -1652,6 +1667,9 @@ def main() -> None:
                 feedback_fn(feedback_message)
                 st.session_state.process_feedback_level = None
                 st.session_state.process_feedback_message = ""
+
+    if not is_windows and st.session_state.show_upload_dialog:
+        render_cloud_upload_dialog(cloud_workspace_dir)
 
     main_dir_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
     if not main_dir_raw:
