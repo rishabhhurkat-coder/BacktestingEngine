@@ -1398,11 +1398,11 @@ def main() -> None:
                         st.session_state.selected_symbol = None
                         st.rerun()
             else:
-                st.info("Upload CSV files from your computer here. The app will create a private working folder for this browser session.")
+                st.info("Select the folder that contains your raw CSV files. The app will upload that folder and process it automatically for this browser session.")
                 uploaded_raw_files = st.file_uploader(
-                    "Upload Raw CSV Files",
+                    "Upload Raw Files Folder",
                     type="csv",
-                    accept_multiple_files=True,
+                    accept_multiple_files="directory",
                     key="cloud_raw_uploads",
                 )
                 if uploaded_raw_files:
@@ -1420,46 +1420,47 @@ def main() -> None:
                         load_data.clear()
                         st.rerun()
 
-            if st.button("Process Input Files", use_container_width=True):
-                selected_main_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
-                if not selected_main_raw:
-                    st.session_state.process_feedback_level = "error"
-                    st.session_state.process_feedback_message = "Please select the Main Folder first."
+            if is_windows:
+                if st.button("Process Input Files", use_container_width=True):
+                    selected_main_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
+                    if not selected_main_raw:
+                        st.session_state.process_feedback_level = "error"
+                        st.session_state.process_feedback_message = "Please select the Main Folder first."
+                        st.rerun()
+
+                    selected_main_dir = resolve_data_dir(selected_main_raw)
+                    raw_dir = selected_main_dir / "Raw Files"
+                    input_dir = selected_main_dir / "Input Files"
+                    output_dir = selected_main_dir / "Output Files"
+
+                    if not selected_main_dir.exists() or not selected_main_dir.is_dir():
+                        st.session_state.process_feedback_level = "error"
+                        st.session_state.process_feedback_message = f"Main folder not found: {selected_main_dir}"
+                        st.rerun()
+
+                    if not raw_dir.exists():
+                        st.session_state.process_feedback_level = "error"
+                        st.session_state.process_feedback_message = f"Raw Files folder not found in {selected_main_dir}"
+                        st.rerun()
+
+                    if not raw_dir.is_dir():
+                        st.session_state.process_feedback_level = "error"
+                        st.session_state.process_feedback_message = f"Raw Files is not a folder in {selected_main_dir}"
+                        st.rerun()
+
+                    input_dir.mkdir(parents=True, exist_ok=True)
+                    output_dir.mkdir(parents=True, exist_ok=True)
+
+                    summary = process_raw_folder(raw_dir, input_dir)
+                    level, message = build_processing_feedback(summary)
+                    st.session_state.process_feedback_level = level
+                    st.session_state.process_feedback_message = message
+                    st.session_state.data_dir_path_input = str(input_dir)
+                    st.session_state.output_dir_path_input = str(output_dir)
+                    st.session_state.selected_symbol = None
+                    list_symbols.clear()
+                    load_data.clear()
                     st.rerun()
-
-                selected_main_dir = resolve_data_dir(selected_main_raw)
-                raw_dir = selected_main_dir / "Raw Files"
-                input_dir = selected_main_dir / "Input Files"
-                output_dir = selected_main_dir / "Output Files"
-
-                if not selected_main_dir.exists() or not selected_main_dir.is_dir():
-                    st.session_state.process_feedback_level = "error"
-                    st.session_state.process_feedback_message = f"Main folder not found: {selected_main_dir}"
-                    st.rerun()
-
-                if not raw_dir.exists():
-                    st.session_state.process_feedback_level = "error"
-                    st.session_state.process_feedback_message = f"Raw Files folder not found in {selected_main_dir}"
-                    st.rerun()
-
-                if not raw_dir.is_dir():
-                    st.session_state.process_feedback_level = "error"
-                    st.session_state.process_feedback_message = f"Raw Files is not a folder in {selected_main_dir}"
-                    st.rerun()
-
-                input_dir.mkdir(parents=True, exist_ok=True)
-                output_dir.mkdir(parents=True, exist_ok=True)
-
-                summary = process_raw_folder(raw_dir, input_dir)
-                level, message = build_processing_feedback(summary)
-                st.session_state.process_feedback_level = level
-                st.session_state.process_feedback_message = message
-                st.session_state.data_dir_path_input = str(input_dir)
-                st.session_state.output_dir_path_input = str(output_dir)
-                st.session_state.selected_symbol = None
-                list_symbols.clear()
-                load_data.clear()
-                st.rerun()
 
             feedback_level = st.session_state.get("process_feedback_level")
             feedback_message = str(st.session_state.get("process_feedback_message") or "").strip()
@@ -1521,7 +1522,7 @@ def main() -> None:
             if is_windows:
                 st.error(f"No raw CSV files found in {raw_dir}")
             else:
-                st.info("Upload raw CSV files from your computer to begin.")
+                st.info("Select your raw-files folder from your computer to begin.")
         return
 
     symbol_names = list(symbols.keys())
