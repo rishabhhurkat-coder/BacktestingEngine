@@ -4,7 +4,7 @@ import calendar
 import io
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import tempfile
 from typing import Any
 from uuid import uuid4
@@ -536,6 +536,38 @@ def build_upload_signature(uploaded_files: list[Any]) -> tuple[tuple[str, int], 
     return tuple(sorted(signature))
 
 
+def detected_upload_folder_path(uploaded_files: list[Any]) -> str:
+    normalized_parts: list[tuple[str, ...]] = []
+    for uploaded_file in uploaded_files:
+        raw_name = str(getattr(uploaded_file, "name", "") or "").strip()
+        if not raw_name:
+            continue
+        clean_name = raw_name.replace("\\", "/")
+        path_parts = tuple(part for part in PurePosixPath(clean_name).parts[:-1] if part)
+        if path_parts:
+            normalized_parts.append(path_parts)
+
+    if not normalized_parts:
+        return ""
+
+    common_parts = list(normalized_parts[0])
+    for path_parts in normalized_parts[1:]:
+        match_count = 0
+        for left, right in zip(common_parts, path_parts):
+            if left != right:
+                break
+            match_count += 1
+        common_parts = common_parts[:match_count]
+        if not common_parts:
+            break
+
+    if common_parts:
+        return "/".join(common_parts)
+
+    first_parts = normalized_parts[0]
+    return first_parts[0] if first_parts else ""
+
+
 def folder_has_supported_data_files(folder: Path) -> bool:
     return bool(list_supported_data_files(folder))
 
@@ -701,17 +733,38 @@ def render_cloud_upload_dialog(main_dir: Path) -> None:
         accept_multiple_files="directory",
         key=f"cloud_raw_uploads_{st.session_state.cloud_uploader_nonce}",
     )
+    raw_upload_path = detected_upload_folder_path(uploaded_raw_files or [])
+    st.text_input(
+        "Detected Raw Folder Path",
+        value=raw_upload_path,
+        disabled=True,
+        placeholder="No raw folder selected yet",
+    )
     uploaded_input_files = st.file_uploader(
         "Upload Input Files Folder",
         type=UPLOAD_DATA_TYPES,
         accept_multiple_files="directory",
         key=f"cloud_input_uploads_{st.session_state.cloud_input_uploader_nonce}",
     )
+    input_upload_path = detected_upload_folder_path(uploaded_input_files or [])
+    st.text_input(
+        "Detected Input Folder Path",
+        value=input_upload_path,
+        disabled=True,
+        placeholder="No input folder selected yet",
+    )
     uploaded_output_files = st.file_uploader(
         "Upload Output Files Folder",
         type=UPLOAD_DATA_TYPES,
         accept_multiple_files="directory",
         key=f"cloud_output_uploads_{st.session_state.cloud_output_uploader_nonce}",
+    )
+    output_upload_path = detected_upload_folder_path(uploaded_output_files or [])
+    st.text_input(
+        "Detected Output Folder Path",
+        value=output_upload_path,
+        disabled=True,
+        placeholder="No output folder selected yet",
     )
 
     process_choice = "No"
