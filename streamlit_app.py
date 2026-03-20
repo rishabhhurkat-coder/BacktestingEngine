@@ -693,6 +693,40 @@ def read_file_bytes(file_path: Path) -> bytes | None:
     return file_path.read_bytes()
 
 
+def build_trade_table_download_bytes(
+    saved_signals: list[dict[str, Any]],
+    symbol: str,
+    default_qty: int,
+) -> bytes | None:
+    trade_df = build_saved_signals_trade_table(
+        saved_signals,
+        symbol=symbol,
+        default_qty=default_qty,
+    )
+    if trade_df.empty:
+        return None
+
+    export_columns = [
+        "Sr.No",
+        "Date",
+        "Time",
+        "Trade",
+        "Price",
+        "Entry Date",
+        "Entry Time",
+        "Entry Price",
+        "Exit Date",
+        "Exit Time",
+        "Exit Price",
+        "Qty",
+        "PL Points",
+        "PL Amt",
+        "Candle Analysis",
+    ]
+    export_df = trade_df.loc[:, [col for col in export_columns if col in trade_df.columns]].copy()
+    return export_df.to_csv(index=False).encode("utf-8")
+
+
 @st.dialog("Upload Files", width="large")
 def render_cloud_upload_dialog(main_dir: Path) -> None:
     st.caption("Upload any combination of raw, input, and output folders.")
@@ -1919,7 +1953,11 @@ def main() -> None:
         apply_saved_signals_state(persisted_saved_signals, symbol, output_csv_path)
         st.session_state.confirm_clear_all = False
 
-    trade_download_bytes = read_file_bytes(output_csv_path)
+    trade_download_bytes = build_trade_table_download_bytes(
+        st.session_state.saved_signals,
+        symbol=symbol,
+        default_qty=int(st.session_state.get("qty", 1) or 1),
+    )
     input_download_path = Path(symbols[symbol])
     input_download_bytes = read_file_bytes(input_download_path)
 
@@ -2230,8 +2268,8 @@ def main() -> None:
             st.download_button(
                 "Trade Data",
                 data=trade_download_bytes or b"",
-                file_name=output_csv_path.name,
-                mime=tabular_mime_type(output_csv_path),
+                file_name=f"{symbol}_trade_data.csv",
+                mime="text/csv",
                 use_container_width=True,
                 disabled=trade_download_bytes is None,
                 key="download-trade-data",
