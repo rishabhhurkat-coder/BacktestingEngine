@@ -611,7 +611,7 @@ const Chart = ({
       borderVisible: false,
       wickUpColor: "#089981",
       wickDownColor: "#f23645",
-      priceLineVisible: true,
+      priceLineVisible: false,
       lastValueVisible: true,
     });
 
