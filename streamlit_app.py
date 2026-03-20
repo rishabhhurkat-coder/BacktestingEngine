@@ -695,18 +695,11 @@ def read_file_bytes(file_path: Path) -> bytes | None:
 @st.dialog("Upload Files", width="large")
 def render_cloud_upload_dialog(main_dir: Path) -> None:
     st.caption("Upload any combination of raw, input, and output folders.")
-    target_raw_dir, target_input_dir, target_output_dir = ensure_workspace_dirs(main_dir)
     uploaded_raw_files = st.file_uploader(
         "Upload Raw Files Folder",
         type=UPLOAD_DATA_TYPES,
         accept_multiple_files="directory",
         key=f"cloud_raw_uploads_{st.session_state.cloud_uploader_nonce}",
-    )
-    st.text_input(
-        "Target Raw Folder Path",
-        value=str(target_raw_dir),
-        disabled=True,
-        placeholder="No raw folder path available",
     )
     uploaded_input_files = st.file_uploader(
         "Upload Input Files Folder",
@@ -714,23 +707,11 @@ def render_cloud_upload_dialog(main_dir: Path) -> None:
         accept_multiple_files="directory",
         key=f"cloud_input_uploads_{st.session_state.cloud_input_uploader_nonce}",
     )
-    st.text_input(
-        "Target Input Folder Path",
-        value=str(target_input_dir),
-        disabled=True,
-        placeholder="No input folder path available",
-    )
     uploaded_output_files = st.file_uploader(
         "Upload Output Files Folder",
         type=UPLOAD_DATA_TYPES,
         accept_multiple_files="directory",
         key=f"cloud_output_uploads_{st.session_state.cloud_output_uploader_nonce}",
-    )
-    st.text_input(
-        "Target Output Folder Path",
-        value=str(target_output_dir),
-        disabled=True,
-        placeholder="No output folder path available",
     )
 
     process_choice = "No"
