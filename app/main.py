@@ -179,8 +179,11 @@ def group_google_drive_files_by_symbol(file_infos: list[Any]) -> dict[str, list[
 
 
 def trigger_drive_process_dialog() -> None:
-    if st.session_state.get("drive_process_choice_widget") == "Yes":
+    choice = st.session_state.get("drive_process_choice_widget")
+    if choice == "Yes":
         st.session_state.show_drive_process_dialog = True
+    elif choice == "No":
+        st.session_state.drive_input_sync_choice = None
 
 
 def read_tabular_file(file_path: Path) -> pd.DataFrame:
@@ -1001,6 +1004,26 @@ def process_selected_drive_raw_symbols(
         return level, message, manual_downloads
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
+
+
+def sync_google_drive_input_files_to_dir(
+    drive_status: Any,
+    target_dir: Path,
+) -> tuple[str, str, int]:
+    if not getattr(drive_status, "connected", False) or getattr(drive_status, "input_folder", None) is None:
+        return "warning", "Google Drive Input Files are not connected yet.", 0
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    drive_input_files = filter_supported_google_drive_files(
+        list_google_drive_folder_files(drive_status.input_folder.folder_id)
+    )
+    if not drive_input_files:
+        clear_supported_data_files(target_dir)
+        return "warning", "No supported files were found in Google Drive Input Files.", 0
+
+    clear_supported_data_files(target_dir)
+    download_google_drive_files_to_dir(drive_input_files, target_dir)
+    return "success", f"Loaded {len(drive_input_files)} input file(s) from Google Drive.", len(drive_input_files)
 
 
 def build_saved_signal_timestamp(date_value: Any, time_value: Any) -> pd.Timestamp:
@@ -1841,6 +1864,8 @@ def main() -> None:
     st.session_state.setdefault("drive_selected_symbols", [])
     st.session_state.setdefault("drive_dialog_feedback_level", None)
     st.session_state.setdefault("drive_dialog_feedback_message", "")
+    st.session_state.setdefault("drive_input_sync_choice", None)
+    st.session_state.setdefault("drive_input_sync_file_count", 0)
     cloud_workspace_dir = cloud_workspace_root / st.session_state.cloud_workspace_session_id
     drive_status = get_google_drive_connection_status()
     drive_raw_files: list[Any] = []
@@ -2032,10 +2057,26 @@ def main() -> None:
                         st.rerun()
             else:
                 raw_dir, input_dir, output_dir = ensure_workspace_dirs(cloud_workspace_dir)
-                has_processed_input_files = folder_has_supported_data_files(input_dir)
                 st.session_state.main_dir_path_input = str(cloud_workspace_dir)
                 st.session_state.data_dir_path_input = str(input_dir)
                 st.session_state.output_dir_path_input = str(output_dir)
+                if (
+                    drive_status.connected
+                    and drive_raw_files
+                    and st.session_state.get("drive_process_choice_widget") == "No"
+                    and st.session_state.get("drive_input_sync_choice") != "No"
+                ):
+                    level, message, file_count = sync_google_drive_input_files_to_dir(drive_status, input_dir)
+                    st.session_state.process_feedback_level = level
+                    st.session_state.process_feedback_message = message
+                    st.session_state.drive_input_sync_choice = "No"
+                    st.session_state.drive_input_sync_file_count = file_count
+                    st.session_state.selected_symbol = None
+                    list_google_drive_folder_files.clear()
+                    list_symbols.clear()
+                    load_data.clear()
+                    st.rerun()
+                has_processed_input_files = folder_has_supported_data_files(input_dir)
                 if has_processed_input_files:
                     st.success("Files are ready for this browser session.")
 
@@ -2053,6 +2094,8 @@ def main() -> None:
                     st.session_state.cloud_output_uploader_nonce += 1
                     st.session_state.drive_dialog_feedback_level = None
                     st.session_state.drive_dialog_feedback_message = ""
+                    st.session_state.drive_input_sync_choice = None
+                    st.session_state.drive_input_sync_file_count = 0
                     st.session_state.drive_manual_input_downloads = []
                     st.session_state.selected_symbol = None
                     list_symbols.clear()
