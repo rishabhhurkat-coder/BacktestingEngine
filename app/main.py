@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import io
+import shutil
 import subprocess
 import sys
 import time
@@ -15,8 +16,13 @@ import pandas as pd
 import streamlit as st
 
 from .component import tv_chart_component, build_dir
-from .data_pipeline import process_raw_folder
-from .google_drive import get_google_drive_connection_status, list_google_drive_folder_files
+from .data_pipeline import extract_symbol, process_raw_folder
+from .google_drive import (
+    download_google_drive_files_to_dir,
+    get_google_drive_connection_status,
+    list_google_drive_folder_files,
+    upload_google_drive_file,
+)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 APP_ENTRY = BASE_DIR / "streamlit_app.py"
@@ -162,6 +168,14 @@ def filter_supported_google_drive_files(file_infos: list[Any]) -> list[Any]:
         if suffix in SUPPORTED_DATA_EXTENSIONS:
             supported_files.append(file_info)
     return supported_files
+
+
+def group_google_drive_files_by_symbol(file_infos: list[Any]) -> dict[str, list[Any]]:
+    grouped_files: dict[str, list[Any]] = {}
+    for file_info in file_infos:
+        symbol = extract_symbol(str(getattr(file_info, "name", "")))
+        grouped_files.setdefault(symbol, []).append(file_info)
+    return dict(sorted(grouped_files.items(), key=lambda item: item[0].lower()))
 
 
 def read_tabular_file(file_path: Path) -> pd.DataFrame:
@@ -819,6 +833,62 @@ def build_processing_feedback(summary) -> tuple[str, str]:
     if summary.errors:
         message = f"{message}. {summary.errors[0]}"
     return level, message
+
+
+def process_selected_drive_raw_symbols(
+    selected_symbols: list[str],
+    symbol_files: dict[str, list[Any]],
+    input_dir: Path,
+    drive_input_folder_id: str,
+) -> tuple[str, str]:
+    if not str(drive_input_folder_id or "").strip():
+        return "error", "Google Drive Input Files folder is not available."
+    if not selected_symbols:
+        return "warning", "Please select at least one scrip to process."
+
+    missing_symbols = [symbol for symbol in selected_symbols if symbol not in symbol_files]
+    if missing_symbols:
+        joined = ", ".join(sorted(missing_symbols))
+        return "error", f"Selected scrips were not found in Google Drive Raw Files: {joined}"
+
+    temp_root = Path(tempfile.mkdtemp(prefix="ema_drive_process_"))
+    temp_raw_dir = temp_root / "Raw Files"
+    temp_input_dir = temp_root / "Input Files"
+    temp_raw_dir.mkdir(parents=True, exist_ok=True)
+    temp_input_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        selected_files: list[Any] = []
+        for symbol in selected_symbols:
+            selected_files.extend(symbol_files.get(symbol, []))
+
+        download_google_drive_files_to_dir(selected_files, temp_raw_dir)
+        summary = process_raw_folder(temp_raw_dir, temp_input_dir)
+
+        for symbol in selected_symbols:
+            processed_csv_path = temp_input_dir / f"{symbol}.csv"
+            if not processed_csv_path.exists():
+                continue
+            target_csv_path = csv_path_for_stem(input_dir, symbol)
+            target_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(processed_csv_path, target_csv_path)
+            remove_other_matching_data_files(input_dir, symbol, target_csv_path)
+            upload_google_drive_file(
+                folder_id=drive_input_folder_id,
+                file_name=target_csv_path.name,
+                content=processed_csv_path.read_bytes(),
+                mime_type="text/csv",
+            )
+
+        level, message = build_processing_feedback(summary)
+        if summary.processed:
+            processed_names = ", ".join(result.symbol for result in summary.processed[:5])
+            extra_count = max(0, len(summary.processed) - 5)
+            suffix = f" (+{extra_count} more)" if extra_count else ""
+            message = f"{message}. Uploaded to Google Drive Input Files: {processed_names}{suffix}"
+        return level, message
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def build_saved_signal_timestamp(date_value: Any, time_value: Any) -> pd.Timestamp:
@@ -1654,17 +1724,29 @@ def main() -> None:
     st.session_state.setdefault("cloud_output_uploader_nonce", 0)
     st.session_state.setdefault("show_upload_dialog", False)
     st.session_state.setdefault("drive_process_choice", "No")
+    st.session_state.setdefault("drive_selected_symbols", [])
     cloud_workspace_dir = cloud_workspace_root / st.session_state.cloud_workspace_session_id
     drive_status = get_google_drive_connection_status()
     drive_raw_files: list[Any] = []
+    drive_raw_symbol_files: dict[str, list[Any]] = {}
+    drive_raw_symbol_names: list[str] = []
     drive_raw_files_error = ""
     if drive_status.connected and drive_status.raw_folder is not None:
         try:
             drive_raw_files = filter_supported_google_drive_files(
                 list_google_drive_folder_files(drive_status.raw_folder.folder_id)
             )
+            drive_raw_symbol_files = group_google_drive_files_by_symbol(drive_raw_files)
+            drive_raw_symbol_names = list(drive_raw_symbol_files.keys())
         except Exception as exc:
             drive_raw_files_error = str(exc)
+    selected_drive_symbols = [
+        symbol
+        for symbol in st.session_state.get("drive_selected_symbols", [])
+        if symbol in drive_raw_symbol_names
+    ]
+    if selected_drive_symbols != st.session_state.get("drive_selected_symbols", []):
+        st.session_state.drive_selected_symbols = selected_drive_symbols
     if (
         not st.session_state.main_dir_path_input
         and not is_windows
@@ -1823,8 +1905,42 @@ def main() -> None:
                         ["No", "Yes"],
                         horizontal=True,
                         key="drive_process_choice",
-                        help="Task 2 only adds the raw-file detection and this choice. Processing will be wired in the next task.",
+                        help="Choose Yes when you want to process selected raw scrips from Google Drive.",
                     )
+                    if st.session_state.get("drive_process_choice") == "Yes":
+                        st.multiselect(
+                            "Select Drive Scrips to Process",
+                            drive_raw_symbol_names,
+                            key="drive_selected_symbols",
+                            help="Only the selected scrips will be processed from Google Drive Raw Files.",
+                        )
+                        if st.button("Process Selected Drive Scrips", use_container_width=True):
+                            workspace_dir_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
+                            workspace_dir = (
+                                resolve_main_workspace_dir(workspace_dir_raw)
+                                if workspace_dir_raw
+                                else cloud_workspace_dir
+                            )
+                            _, input_dir, output_dir = ensure_workspace_dirs(workspace_dir)
+                            try:
+                                level, message = process_selected_drive_raw_symbols(
+                                    selected_symbols=list(st.session_state.get("drive_selected_symbols", [])),
+                                    symbol_files=drive_raw_symbol_files,
+                                    input_dir=input_dir,
+                                    drive_input_folder_id=drive_status.input_folder.folder_id if drive_status.input_folder else "",
+                                )
+                            except Exception as exc:
+                                level, message = "error", f"Google Drive processing failed: {exc}"
+                            st.session_state.process_feedback_level = level
+                            st.session_state.process_feedback_message = message
+                            st.session_state.main_dir_path_input = str(workspace_dir)
+                            st.session_state.data_dir_path_input = str(input_dir)
+                            st.session_state.output_dir_path_input = str(output_dir)
+                            st.session_state.selected_symbol = None
+                            list_google_drive_folder_files.clear()
+                            list_symbols.clear()
+                            load_data.clear()
+                            st.rerun()
                 else:
                     st.caption("No supported raw files found in Google Drive yet.")
             elif drive_status.configured:

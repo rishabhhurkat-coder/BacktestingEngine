@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,10 +11,13 @@ try:
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
     from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 except ImportError:  # pragma: no cover - depends on environment packages
     service_account = None
     build = None
     HttpError = Exception
+    MediaIoBaseDownload = None
+    MediaIoBaseUpload = None
 
 GOOGLE_DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
 
@@ -133,6 +137,10 @@ def _fetch_folder_info(service, folder_id: str) -> GoogleDriveFolderInfo:
     )
 
 
+def _escape_drive_query_value(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 @st.cache_data(show_spinner=False)
 def list_google_drive_folder_files(folder_id: str) -> list[GoogleDriveFileInfo]:
     config = load_google_drive_config()
@@ -164,6 +172,87 @@ def list_google_drive_folder_files(folder_id: str) -> list[GoogleDriveFileInfo]:
         if not page_token:
             break
     return files
+
+
+def download_google_drive_file(file_id: str) -> bytes:
+    config = load_google_drive_config()
+    if config is None:
+        raise RuntimeError("Google Drive is not configured in Streamlit secrets yet.")
+    if MediaIoBaseDownload is None:
+        raise RuntimeError("Google Drive packages are not installed yet.")
+
+    service = build_google_drive_service(config)
+    request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    return buffer.getvalue()
+
+
+def download_google_drive_files_to_dir(files: list[GoogleDriveFileInfo], target_dir) -> list[str]:
+    from pathlib import Path
+
+    target_dir = Path(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    written_paths: list[str] = []
+    for file_info in files:
+        target_path = target_dir / file_info.name
+        target_path.write_bytes(download_google_drive_file(file_info.file_id))
+        written_paths.append(str(target_path))
+    return written_paths
+
+
+def upload_google_drive_file(folder_id: str, file_name: str, content: bytes, mime_type: str) -> GoogleDriveFileInfo:
+    config = load_google_drive_config()
+    if config is None:
+        raise RuntimeError("Google Drive is not configured in Streamlit secrets yet.")
+    if MediaIoBaseUpload is None:
+        raise RuntimeError("Google Drive packages are not installed yet.")
+
+    service = build_google_drive_service(config)
+    escaped_name = _escape_drive_query_value(file_name)
+    query = f"'{folder_id}' in parents and name = '{escaped_name}' and trashed = false"
+    existing_response = service.files().list(
+        q=query,
+        fields="files(id,name,mimeType,size)",
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        pageSize=50,
+    ).execute()
+    existing_files = existing_response.get("files", [])
+    media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
+
+    if existing_files:
+        primary = existing_files[0]
+        updated = service.files().update(
+            fileId=primary["id"],
+            media_body=media,
+            supportsAllDrives=True,
+            fields="id,name,mimeType,size",
+        ).execute()
+        for duplicate in existing_files[1:]:
+            service.files().delete(fileId=duplicate["id"], supportsAllDrives=True).execute()
+        return GoogleDriveFileInfo(
+            file_id=str(updated.get("id") or primary["id"]),
+            name=str(updated.get("name") or file_name),
+            mime_type=str(updated.get("mimeType") or mime_type),
+            size=int(updated["size"]) if updated.get("size") is not None else None,
+        )
+
+    created = service.files().create(
+        body={"name": file_name, "parents": [folder_id]},
+        media_body=media,
+        supportsAllDrives=True,
+        fields="id,name,mimeType,size",
+    ).execute()
+    return GoogleDriveFileInfo(
+        file_id=str(created.get("id") or ""),
+        name=str(created.get("name") or file_name),
+        mime_type=str(created.get("mimeType") or mime_type),
+        size=int(created["size"]) if created.get("size") is not None else None,
+    )
 
 
 @st.cache_data(show_spinner=False)
