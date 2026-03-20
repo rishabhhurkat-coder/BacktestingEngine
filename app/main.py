@@ -2287,7 +2287,6 @@ def main() -> None:
                     st.session_state.process_feedback_message = message
                     st.session_state.drive_input_sync_choice = "No"
                     st.session_state.drive_input_sync_file_count = file_count
-                    st.session_state.selected_symbol = None
                     list_google_drive_folder_files.clear()
                     list_symbols.clear()
                     load_data.clear()
@@ -2786,6 +2785,7 @@ def main() -> None:
                     reload_level = "error"
                     reload_message = f"Could not reload Google Drive Output data for {display_symbol(symbol)}: {exc}"
                     persisted_saved_signals = None
+                st.session_state.selected_symbol = symbol
                 st.session_state.output_reload_feedback_level = reload_level
                 st.session_state.output_reload_feedback_message = reload_message
                 if persisted_saved_signals is not None:
@@ -2804,6 +2804,7 @@ def main() -> None:
 
             st.markdown("**Update Data**")
             if st.button("Update Data", use_container_width=True, key="update-trade-data"):
+                st.session_state.selected_symbol = symbol
                 level, message, manual_download = update_trade_data_in_google_drive(
                     drive_status=drive_status,
                     symbol=symbol,
