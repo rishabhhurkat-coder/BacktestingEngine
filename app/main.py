@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import calendar
-import io
 import shutil
 import subprocess
 import sys
@@ -10,7 +9,6 @@ from pathlib import Path
 import tempfile
 from typing import Any
 from uuid import uuid4
-import zipfile
 
 import pandas as pd
 import streamlit as st
@@ -61,7 +59,6 @@ SESSION_START = "09.15"
 SESSION_END = "15.27"
 CHART_HEIGHT = 700
 SUPPORTED_DATA_EXTENSIONS = (".csv", ".xlsx", ".xlsm", ".xlsb")
-UPLOAD_DATA_TYPES = ["csv", "xlsx", "xlsm", "xlsb"]
 SAVED_SIGNAL_COLUMNS = [
     "Symbol",
     "Date",
@@ -574,37 +571,6 @@ def build_upload_signature(uploaded_files: list[Any]) -> tuple[tuple[str, int], 
     return tuple(sorted(signature))
 
 
-def folder_has_supported_data_files(folder: Path) -> bool:
-    return bool(list_supported_data_files(folder))
-
-
-def sync_uploaded_data_folder(uploaded_files: list[Any], target_dir: Path) -> int:
-    return sync_uploaded_data_folder_as(uploaded_files, target_dir, convert_to_csv=False)
-
-
-def sync_uploaded_data_folder_as(
-    uploaded_files: list[Any],
-    target_dir: Path,
-    *,
-    convert_to_csv: bool,
-) -> int:
-    target_dir.mkdir(parents=True, exist_ok=True)
-    clear_supported_data_files(target_dir)
-    for uploaded_file in uploaded_files:
-        uploaded_name = Path(str(uploaded_file.name)).name
-        if convert_to_csv:
-            target_path = csv_path_for_stem(target_dir, Path(uploaded_name).stem)
-            uploaded_df = read_tabular_source(
-                io.BytesIO(uploaded_file.getbuffer()),
-                Path(uploaded_name).suffix.lower(),
-            )
-            write_tabular_file(uploaded_df, target_path)
-        else:
-            target_path = target_dir / uploaded_name
-            target_path.write_bytes(uploaded_file.getbuffer())
-    return len(uploaded_files)
-
-
 def normalize_processed_input_df(raw_df: pd.DataFrame) -> pd.DataFrame:
     required = ["Date", "Time", "Open", "High", "Low", "Close", "EMA"]
     safe_df = raw_df.copy()
@@ -623,111 +589,6 @@ def normalize_processed_input_df(raw_df: pd.DataFrame) -> pd.DataFrame:
     safe_df = safe_df.sort_values(["DateObj", "Time"], kind="stable")
     safe_df = safe_df.drop_duplicates(subset=["Date", "Time"], keep="last").reset_index(drop=True)
     return safe_df
-
-
-def merge_processed_input_dirs(existing_input_dir: Path, new_input_dir: Path) -> None:
-    existing_input_dir.mkdir(parents=True, exist_ok=True)
-    for new_csv_path in list_supported_data_files(new_input_dir):
-        existing_path = find_data_file_by_stem(existing_input_dir, new_csv_path.stem)
-        target_csv_path = csv_path_for_stem(existing_input_dir, new_csv_path.stem)
-        new_df = normalize_processed_input_df(read_tabular_file(new_csv_path))
-        if existing_path and existing_path.exists():
-            existing_df = normalize_processed_input_df(read_tabular_file(existing_path))
-            merged_df = normalize_processed_input_df(pd.concat([existing_df, new_df], ignore_index=True))
-        else:
-            merged_df = new_df
-        write_tabular_file(merged_df.drop(columns=["DateObj"], errors="ignore"), target_csv_path)
-        remove_other_matching_data_files(existing_input_dir, new_csv_path.stem, target_csv_path)
-
-
-def process_cloud_uploaded_files(
-    uploaded_raw_files: list[Any],
-    uploaded_input_files: list[Any],
-    uploaded_output_files: list[Any],
-    process_uploaded_input: bool,
-    main_dir: Path,
-) -> tuple[str, str]:
-    raw_dir, input_dir, output_dir = ensure_workspace_dirs(main_dir)
-    messages: list[str] = []
-    level = "success"
-
-    if uploaded_output_files:
-        sync_uploaded_data_folder_as(uploaded_output_files, output_dir, convert_to_csv=True)
-        messages.append(f"Loaded {len(uploaded_output_files)} output file(s) as CSV")
-
-    if uploaded_input_files:
-        sync_uploaded_data_folder_as(uploaded_input_files, input_dir, convert_to_csv=True)
-        messages.append(f"Loaded {len(uploaded_input_files)} input file(s) as CSV")
-
-    if uploaded_raw_files:
-        sync_uploaded_data_folder(uploaded_raw_files, raw_dir)
-        messages.append(f"Loaded {len(uploaded_raw_files)} raw file(s)")
-
-        if process_uploaded_input or not uploaded_input_files:
-            temp_processed_dir = Path(tempfile.mkdtemp(prefix="ema_processed_"))
-            try:
-                summary = process_raw_folder(raw_dir, temp_processed_dir)
-                if uploaded_input_files and process_uploaded_input:
-                    merge_processed_input_dirs(input_dir, temp_processed_dir)
-                    messages.append("Merged processed raw files with uploaded input files")
-                else:
-                    clear_supported_data_files(input_dir)
-                    merge_processed_input_dirs(input_dir, temp_processed_dir)
-                summary_level, summary_message = build_processing_feedback(summary)
-                if summary_level == "warning" and level == "success":
-                    level = "warning"
-                elif summary_level == "error":
-                    level = "error"
-                messages.append(summary_message)
-            finally:
-                for temp_csv_path in list_supported_data_files(temp_processed_dir):
-                    try:
-                        temp_csv_path.unlink()
-                    except OSError:
-                        continue
-                try:
-                    temp_processed_dir.rmdir()
-                except OSError:
-                    pass
-        else:
-            messages.append("Using uploaded input files as CSV")
-    elif uploaded_input_files:
-        messages.append("Using uploaded input files as CSV")
-
-    if not messages:
-        return "warning", "No files were uploaded."
-    return level, ". ".join(messages)
-
-
-def sync_uploaded_raw_files(uploaded_files: list[Any], main_dir: Path) -> tuple[str, str]:
-    raw_dir, input_dir, _ = ensure_workspace_dirs(main_dir)
-    clear_supported_data_files(raw_dir)
-    clear_supported_data_files(input_dir)
-
-    for uploaded_file in uploaded_files:
-        target_path = raw_dir / Path(str(uploaded_file.name)).name
-        target_path.write_bytes(uploaded_file.getbuffer())
-
-    summary = process_raw_folder(raw_dir, input_dir)
-    return build_processing_feedback(summary)
-
-
-def build_output_trades_zip(output_dir: Path) -> bytes | None:
-    csv_paths = list_supported_data_files(output_dir)
-    if not csv_paths:
-        return None
-
-    buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for csv_path in csv_paths:
-            archive.writestr(csv_path.name, csv_path.read_bytes())
-    return buffer.getvalue()
-
-
-def read_file_bytes(file_path: Path) -> bytes | None:
-    if not file_path.exists():
-        return None
-    return file_path.read_bytes()
 
 
 def build_trade_table_download_bytes(
@@ -828,61 +689,6 @@ def update_trade_data_in_google_drive(
             break
 
     return "error", f"Could not update Google Drive Output Files for {display_symbol(symbol)}: {last_error}", None
-
-
-@st.dialog("Upload Files", width="large")
-def render_cloud_upload_dialog(main_dir: Path) -> None:
-    st.caption("Upload any combination of raw, input, and output folders.")
-    uploaded_raw_files = st.file_uploader(
-        "Upload Raw Files Folder",
-        type=UPLOAD_DATA_TYPES,
-        accept_multiple_files="directory",
-        key=f"cloud_raw_uploads_{st.session_state.cloud_uploader_nonce}",
-    )
-    uploaded_input_files = st.file_uploader(
-        "Upload Input Files Folder",
-        type=UPLOAD_DATA_TYPES,
-        accept_multiple_files="directory",
-        key=f"cloud_input_uploads_{st.session_state.cloud_input_uploader_nonce}",
-    )
-    uploaded_output_files = st.file_uploader(
-        "Upload Output Files Folder",
-        type=UPLOAD_DATA_TYPES,
-        accept_multiple_files="directory",
-        key=f"cloud_output_uploads_{st.session_state.cloud_output_uploader_nonce}",
-    )
-
-    process_choice = "No"
-    if uploaded_input_files:
-        process_choice = st.radio(
-            "Process raw files and merge with uploaded input files?",
-            ["No", "Yes"],
-            horizontal=True,
-            key="cloud_process_choice",
-        )
-
-    action_col, cancel_col = st.columns(2, gap="small")
-    with action_col:
-        if st.button("Use Uploaded Files", use_container_width=True):
-            with st.spinner("Applying uploaded files..."):
-                level, message = process_cloud_uploaded_files(
-                    uploaded_raw_files=uploaded_raw_files or [],
-                    uploaded_input_files=uploaded_input_files or [],
-                    uploaded_output_files=uploaded_output_files or [],
-                    process_uploaded_input=(process_choice == "Yes"),
-                    main_dir=main_dir,
-                )
-            st.session_state.process_feedback_level = level
-            st.session_state.process_feedback_message = message
-            st.session_state.selected_symbol = None
-            st.session_state.show_upload_dialog = False
-            list_symbols.clear()
-            load_data.clear()
-            st.rerun()
-    with cancel_col:
-        if st.button("Cancel", use_container_width=True):
-            st.session_state.show_upload_dialog = False
-            st.rerun()
 
 
 @st.dialog("Process Drive Raw Files", width="large")
@@ -2053,11 +1859,6 @@ def main() -> None:
     st.session_state.setdefault("filter_output_dir", None)
     st.session_state.setdefault("selected_symbol", None)
     st.session_state.setdefault("cloud_workspace_session_id", str(uuid4()))
-    st.session_state.setdefault("cloud_raw_upload_signature", ())
-    st.session_state.setdefault("cloud_uploader_nonce", 0)
-    st.session_state.setdefault("cloud_input_uploader_nonce", 0)
-    st.session_state.setdefault("cloud_output_uploader_nonce", 0)
-    st.session_state.setdefault("show_upload_dialog", False)
     st.session_state.setdefault("show_drive_process_dialog", False)
     st.session_state.setdefault("drive_process_choice_widget", "No")
     st.session_state.setdefault("drive_selected_symbols", [])
@@ -2346,9 +2147,6 @@ def main() -> None:
                 st.session_state.process_feedback_level = None
                 st.session_state.process_feedback_message = ""
 
-    if not is_windows and st.session_state.show_upload_dialog:
-        render_cloud_upload_dialog(cloud_workspace_dir)
-
     if st.session_state.get("show_drive_process_dialog"):
         workspace_dir_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
         workspace_dir = (
@@ -2406,14 +2204,17 @@ def main() -> None:
     if not symbols:
         raw_symbols = list_supported_data_files(raw_dir)
         if raw_symbols:
-            st.error("No processed supported data files found in Input Files. Click Process Input Files.")
+            if is_windows:
+                st.error("No processed supported data files found in Input Files. Click Process Input Files.")
+            else:
+                st.info("No processed files are available in Google Drive Input Files yet. Choose 'Yes' to process Drive raw files.")
         else:
             if drive_status.connected and drive_raw_files:
                 st.info("Google Drive raw files were found. Choose 'Yes' in 'Process Raw Files from Google Drive?' to open the processing popup.")
             elif is_windows:
                 st.error(f"No raw supported data files found in {raw_dir}")
             else:
-                st.info("Select your raw-files folder from your computer to begin.")
+                st.info("No supported Google Drive raw files were found yet.")
         return
 
     symbol_names = list(symbols.keys())
