@@ -840,16 +840,16 @@ def process_selected_drive_raw_symbols(
     symbol_files: dict[str, list[Any]],
     input_dir: Path,
     drive_input_folder_id: str,
-) -> tuple[str, str]:
+) -> tuple[str, str, list[dict[str, Any]]]:
     if not str(drive_input_folder_id or "").strip():
-        return "error", "Google Drive Input Files folder is not available."
+        return "error", "Google Drive Input Files folder is not available.", []
     if not selected_symbols:
-        return "warning", "Please select at least one scrip to process."
+        return "warning", "Please select at least one scrip to process.", []
 
     missing_symbols = [symbol for symbol in selected_symbols if symbol not in symbol_files]
     if missing_symbols:
         joined = ", ".join(sorted(missing_symbols))
-        return "error", f"Selected scrips were not found in Google Drive Raw Files: {joined}"
+        return "error", f"Selected scrips were not found in Google Drive Raw Files: {joined}", []
 
     temp_root = Path(tempfile.mkdtemp(prefix="ema_drive_process_"))
     temp_raw_dir = temp_root / "Raw Files"
@@ -871,6 +871,7 @@ def process_selected_drive_raw_symbols(
         download_google_drive_files_to_dir(selected_files, temp_raw_dir)
         summary = process_raw_folder(temp_raw_dir, temp_input_dir)
         missing_drive_targets: list[str] = []
+        manual_downloads: list[dict[str, Any]] = []
         uploaded_drive_targets: list[str] = []
 
         for symbol in selected_symbols:
@@ -884,6 +885,13 @@ def process_selected_drive_raw_symbols(
             drive_file_name = target_csv_path.name
             if drive_file_name.casefold() not in drive_input_files:
                 missing_drive_targets.append(drive_file_name)
+                manual_downloads.append(
+                    {
+                        "file_name": drive_file_name,
+                        "data": processed_csv_path.read_bytes(),
+                        "mime": "text/csv",
+                    }
+                )
                 continue
             upload_google_drive_file(
                 folder_id=drive_input_folder_id,
@@ -906,11 +914,11 @@ def process_selected_drive_raw_symbols(
             message = (
                 f"{message}. Could not create new files in Google Drive Input Files: "
                 f"{missing_preview}{missing_suffix}. "
-                "For My Drive folders, pre-create those CSV files first or move the folder to a Shared Drive."
+                "Download these files below and add them manually, or pre-create them in My Drive, or move the folder to a Shared Drive."
             )
             if level == "success":
                 level = "warning"
-        return level, message
+        return level, message, manual_downloads
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -1738,6 +1746,7 @@ def main() -> None:
     st.session_state.setdefault("output_dir_path_input", "")
     st.session_state.setdefault("process_feedback_level", None)
     st.session_state.setdefault("process_feedback_message", "")
+    st.session_state.setdefault("drive_manual_input_downloads", [])
     st.session_state.setdefault("filter_data_dir", None)
     st.session_state.setdefault("filter_output_dir", None)
     st.session_state.setdefault("selected_symbol", None)
@@ -1947,16 +1956,17 @@ def main() -> None:
                             )
                             _, input_dir, output_dir = ensure_workspace_dirs(workspace_dir)
                             try:
-                                level, message = process_selected_drive_raw_symbols(
+                                level, message, manual_downloads = process_selected_drive_raw_symbols(
                                     selected_symbols=list(st.session_state.get("drive_selected_symbols", [])),
                                     symbol_files=drive_raw_symbol_files,
                                     input_dir=input_dir,
                                     drive_input_folder_id=drive_status.input_folder.folder_id if drive_status.input_folder else "",
                                 )
                             except Exception as exc:
-                                level, message = "error", f"Google Drive processing failed: {exc}"
+                                level, message, manual_downloads = "error", f"Google Drive processing failed: {exc}", []
                             st.session_state.process_feedback_level = level
                             st.session_state.process_feedback_message = message
+                            st.session_state.drive_manual_input_downloads = manual_downloads
                             st.session_state.main_dir_path_input = str(workspace_dir)
                             st.session_state.data_dir_path_input = str(input_dir)
                             st.session_state.output_dir_path_input = str(output_dir)
@@ -2002,6 +2012,7 @@ def main() -> None:
                     st.session_state.cloud_uploader_nonce += 1
                     st.session_state.cloud_input_uploader_nonce += 1
                     st.session_state.cloud_output_uploader_nonce += 1
+                    st.session_state.drive_manual_input_downloads = []
                     st.session_state.selected_symbol = None
                     list_symbols.clear()
                     load_data.clear()
@@ -2058,8 +2069,25 @@ def main() -> None:
                     "error": st.error,
                 }.get(feedback_level, st.info)
                 feedback_fn(feedback_message)
-                st.session_state.process_feedback_level = None
-                st.session_state.process_feedback_message = ""
+                manual_downloads = st.session_state.get("drive_manual_input_downloads") or []
+                if manual_downloads:
+                    st.markdown("**Manual Input File Downloads**")
+                    st.caption("These processed CSV files could not be created automatically in Google Drive. Download them and add them manually to Drive Input Files.")
+                    for item in manual_downloads:
+                        file_name = str(item.get("file_name") or "processed_input.csv")
+                        file_bytes = item.get("data") or b""
+                        mime_type = str(item.get("mime") or "text/csv")
+                        st.download_button(
+                            f"Download {file_name}",
+                            data=file_bytes,
+                            file_name=file_name,
+                            mime=mime_type,
+                            use_container_width=True,
+                            key=f"download-manual-input-{file_name}",
+                        )
+                if not manual_downloads:
+                    st.session_state.process_feedback_level = None
+                    st.session_state.process_feedback_message = ""
 
     if not is_windows and st.session_state.show_upload_dialog:
         render_cloud_upload_dialog(cloud_workspace_dir)
