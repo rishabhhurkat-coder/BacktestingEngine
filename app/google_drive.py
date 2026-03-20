@@ -74,7 +74,10 @@ def load_google_drive_config() -> GoogleDriveConfig | None:
     except Exception:
         return None
 
-    secret_mapping = _normalize_secret_mapping(secrets.get("google_drive", {}))
+    try:
+        secret_mapping = _normalize_secret_mapping(secrets.get("google_drive", {}))
+    except Exception:
+        return None
     if not secret_mapping:
         return None
 
