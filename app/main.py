@@ -810,6 +810,52 @@ def render_cloud_upload_dialog(main_dir: Path) -> None:
             st.rerun()
 
 
+@st.dialog("Process Drive Raw Files", width="large")
+def render_drive_process_dialog(
+    symbol_names: list[str],
+    symbol_files: dict[str, list[Any]],
+    main_dir: Path,
+    drive_input_folder_id: str,
+) -> None:
+    st.caption("Select one or more scrips from Google Drive Raw Files to process into Input Files.")
+    st.multiselect(
+        "Select Drive Scrips to Process",
+        symbol_names,
+        key="drive_selected_symbols",
+        help="Only the selected scrips will be processed from Google Drive Raw Files.",
+    )
+
+    process_col, cancel_col = st.columns(2, gap="small")
+    with process_col:
+        if st.button("Process Selected Drive Scrips", use_container_width=True):
+            _, input_dir, output_dir = ensure_workspace_dirs(main_dir)
+            try:
+                level, message, manual_downloads = process_selected_drive_raw_symbols(
+                    selected_symbols=list(st.session_state.get("drive_selected_symbols", [])),
+                    symbol_files=symbol_files,
+                    input_dir=input_dir,
+                    drive_input_folder_id=drive_input_folder_id,
+                )
+            except Exception as exc:
+                level, message, manual_downloads = "error", f"Google Drive processing failed: {exc}", []
+            st.session_state.process_feedback_level = level
+            st.session_state.process_feedback_message = message
+            st.session_state.drive_manual_input_downloads = manual_downloads
+            st.session_state.main_dir_path_input = str(main_dir)
+            st.session_state.data_dir_path_input = str(input_dir)
+            st.session_state.output_dir_path_input = str(output_dir)
+            st.session_state.selected_symbol = None
+            st.session_state.show_drive_process_dialog = False
+            list_google_drive_folder_files.clear()
+            list_symbols.clear()
+            load_data.clear()
+            st.rerun()
+    with cancel_col:
+        if st.button("Cancel", use_container_width=True):
+            st.session_state.show_drive_process_dialog = False
+            st.rerun()
+
+
 def build_processing_feedback(summary) -> tuple[str, str]:
     parts: list[str] = []
     if summary.processed:
@@ -1756,6 +1802,7 @@ def main() -> None:
     st.session_state.setdefault("cloud_input_uploader_nonce", 0)
     st.session_state.setdefault("cloud_output_uploader_nonce", 0)
     st.session_state.setdefault("show_upload_dialog", False)
+    st.session_state.setdefault("show_drive_process_dialog", False)
     st.session_state.setdefault("drive_process_choice", "No")
     st.session_state.setdefault("drive_selected_symbols", [])
     cloud_workspace_dir = cloud_workspace_root / st.session_state.cloud_workspace_session_id
@@ -1929,10 +1976,6 @@ def main() -> None:
                 if drive_raw_files_error:
                     st.warning(f"Could not read Drive raw files: {drive_raw_files_error}")
                 elif drive_raw_files:
-                    st.caption(f"Drive raw files found: {len(drive_raw_files)}")
-                    preview_names = ", ".join(file_info.name for file_info in drive_raw_files[:3])
-                    if preview_names:
-                        st.caption(f"Examples: {preview_names}")
                     st.radio(
                         "Process Raw Files from Google Drive?",
                         ["No", "Yes"],
@@ -1940,41 +1983,6 @@ def main() -> None:
                         key="drive_process_choice",
                         help="Choose Yes when you want to process selected raw scrips from Google Drive.",
                     )
-                    if st.session_state.get("drive_process_choice") == "Yes":
-                        st.multiselect(
-                            "Select Drive Scrips to Process",
-                            drive_raw_symbol_names,
-                            key="drive_selected_symbols",
-                            help="Only the selected scrips will be processed from Google Drive Raw Files.",
-                        )
-                        if st.button("Process Selected Drive Scrips", use_container_width=True):
-                            workspace_dir_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
-                            workspace_dir = (
-                                resolve_main_workspace_dir(workspace_dir_raw)
-                                if workspace_dir_raw
-                                else cloud_workspace_dir
-                            )
-                            _, input_dir, output_dir = ensure_workspace_dirs(workspace_dir)
-                            try:
-                                level, message, manual_downloads = process_selected_drive_raw_symbols(
-                                    selected_symbols=list(st.session_state.get("drive_selected_symbols", [])),
-                                    symbol_files=drive_raw_symbol_files,
-                                    input_dir=input_dir,
-                                    drive_input_folder_id=drive_status.input_folder.folder_id if drive_status.input_folder else "",
-                                )
-                            except Exception as exc:
-                                level, message, manual_downloads = "error", f"Google Drive processing failed: {exc}", []
-                            st.session_state.process_feedback_level = level
-                            st.session_state.process_feedback_message = message
-                            st.session_state.drive_manual_input_downloads = manual_downloads
-                            st.session_state.main_dir_path_input = str(workspace_dir)
-                            st.session_state.data_dir_path_input = str(input_dir)
-                            st.session_state.output_dir_path_input = str(output_dir)
-                            st.session_state.selected_symbol = None
-                            list_google_drive_folder_files.clear()
-                            list_symbols.clear()
-                            load_data.clear()
-                            st.rerun()
                 else:
                     st.caption("No supported raw files found in Google Drive yet.")
             elif drive_status.configured:
@@ -2092,6 +2100,30 @@ def main() -> None:
     if not is_windows and st.session_state.show_upload_dialog:
         render_cloud_upload_dialog(cloud_workspace_dir)
 
+    if (
+        drive_status.connected
+        and drive_raw_files
+        and st.session_state.get("drive_process_choice") == "Yes"
+        and not st.session_state.get("show_drive_process_dialog")
+    ):
+        st.session_state.show_drive_process_dialog = True
+        st.session_state.drive_process_choice = "No"
+        st.rerun()
+
+    if st.session_state.get("show_drive_process_dialog"):
+        workspace_dir_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
+        workspace_dir = (
+            resolve_main_workspace_dir(workspace_dir_raw)
+            if workspace_dir_raw
+            else cloud_workspace_dir
+        )
+        render_drive_process_dialog(
+            symbol_names=drive_raw_symbol_names,
+            symbol_files=drive_raw_symbol_files,
+            main_dir=workspace_dir,
+            drive_input_folder_id=drive_status.input_folder.folder_id if drive_status.input_folder else "",
+        )
+
     main_dir_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
     if not main_dir_raw:
         st.error("Please select the Main Folder.")
@@ -2138,10 +2170,7 @@ def main() -> None:
             st.error("No processed supported data files found in Input Files. Click Process Input Files.")
         else:
             if drive_status.connected and drive_raw_files:
-                if st.session_state.get("drive_process_choice") == "Yes":
-                    st.info("Google Drive raw files are ready. Processing selected Drive raw files will be added in the next task.")
-                else:
-                    st.info("Google Drive raw files were found. Choose 'Yes' in 'Process Raw Files from Google Drive?' when you want to process them.")
+                st.info("Google Drive raw files were found. Choose 'Yes' in 'Process Raw Files from Google Drive?' to open the processing popup.")
             elif is_windows:
                 st.error(f"No raw supported data files found in {raw_dir}")
             else:
