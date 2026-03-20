@@ -178,6 +178,11 @@ def group_google_drive_files_by_symbol(file_infos: list[Any]) -> dict[str, list[
     return dict(sorted(grouped_files.items(), key=lambda item: item[0].lower()))
 
 
+def trigger_drive_process_dialog() -> None:
+    if st.session_state.get("drive_process_choice_widget") == "Yes":
+        st.session_state.show_drive_process_dialog = True
+
+
 def read_tabular_file(file_path: Path) -> pd.DataFrame:
     suffix = file_path.suffix.lower()
     return read_tabular_source(file_path, suffix)
@@ -1803,7 +1808,7 @@ def main() -> None:
     st.session_state.setdefault("cloud_output_uploader_nonce", 0)
     st.session_state.setdefault("show_upload_dialog", False)
     st.session_state.setdefault("show_drive_process_dialog", False)
-    st.session_state.setdefault("drive_process_choice", "No")
+    st.session_state.setdefault("drive_process_choice_widget", "No")
     st.session_state.setdefault("drive_selected_symbols", [])
     cloud_workspace_dir = cloud_workspace_root / st.session_state.cloud_workspace_session_id
     drive_status = get_google_drive_connection_status()
@@ -1967,12 +1972,6 @@ def main() -> None:
             st.markdown("**Google Drive**")
             if drive_status.connected:
                 st.success(drive_status.message)
-                if drive_status.raw_folder is not None:
-                    st.caption(f"Raw Files: {drive_status.raw_folder.name}")
-                if drive_status.input_folder is not None:
-                    st.caption(f"Input Files: {drive_status.input_folder.name}")
-                if drive_status.output_folder is not None:
-                    st.caption(f"Output Files: {drive_status.output_folder.name}")
                 if drive_raw_files_error:
                     st.warning(f"Could not read Drive raw files: {drive_raw_files_error}")
                 elif drive_raw_files:
@@ -1980,7 +1979,8 @@ def main() -> None:
                         "Process Raw Files from Google Drive?",
                         ["No", "Yes"],
                         horizontal=True,
-                        key="drive_process_choice",
+                        key="drive_process_choice_widget",
+                        on_change=trigger_drive_process_dialog,
                         help="Choose Yes when you want to process selected raw scrips from Google Drive.",
                     )
                 else:
@@ -2099,16 +2099,6 @@ def main() -> None:
 
     if not is_windows and st.session_state.show_upload_dialog:
         render_cloud_upload_dialog(cloud_workspace_dir)
-
-    if (
-        drive_status.connected
-        and drive_raw_files
-        and st.session_state.get("drive_process_choice") == "Yes"
-        and not st.session_state.get("show_drive_process_dialog")
-    ):
-        st.session_state.show_drive_process_dialog = True
-        st.session_state.drive_process_choice = "No"
-        st.rerun()
 
     if st.session_state.get("show_drive_process_dialog"):
         workspace_dir_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
