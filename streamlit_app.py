@@ -4,6 +4,7 @@ import calendar
 import io
 import subprocess
 import sys
+import time
 from pathlib import Path
 import tempfile
 from typing import Any
@@ -1077,6 +1078,10 @@ def remove_signal(signal_record: dict[str, Any], output_csv_path: Path) -> bool:
     return True
 
 
+def chart_click_token(symbol: str, signal_key: str) -> str:
+    return f"{symbol}|{signal_key}"
+
+
 def build_markers(symbol: str) -> list[dict[str, Any]]:
     markers: list[dict[str, Any]] = []
     for item in st.session_state.saved_signals:
@@ -1571,6 +1576,8 @@ def main() -> None:
     st.session_state.setdefault("show_saved_signals_panel", True)
     st.session_state.setdefault("build_signature", None)
     st.session_state.setdefault("qty", 1)
+    st.session_state.setdefault("last_chart_click_token", None)
+    st.session_state.setdefault("last_chart_click_at", 0.0)
     st.session_state.setdefault("chart_window_start", None)
     st.session_state.setdefault("filter_source_from", None)
     st.session_state.setdefault("filter_source_to", None)
@@ -2090,10 +2097,29 @@ def main() -> None:
             }
 
             signal_record = build_signal_record(symbol, clicked_row)
-            if chart_event_type == "chart_double_click":
+            signal_token = chart_click_token(symbol, signal_record["SignalKey"])
+            now_monotonic = time.monotonic()
+            previous_token = st.session_state.get("last_chart_click_token")
+            previous_at = float(st.session_state.get("last_chart_click_at") or 0.0)
+            signal_exists = any(
+                item["SignalKey"] == signal_record["SignalKey"]
+                for item in st.session_state.saved_signals
+            )
+            repeated_quick_click = (
+                chart_event_type != "chart_double_click"
+                and signal_exists
+                and previous_token == signal_token
+                and (now_monotonic - previous_at) <= 0.8
+            )
+
+            if chart_event_type == "chart_double_click" or repeated_quick_click:
                 remove_signal(signal_record, output_csv_path)
+                st.session_state.last_chart_click_token = None
+                st.session_state.last_chart_click_at = 0.0
             else:
                 save_signal(signal_record, output_csv_path)
+                st.session_state.last_chart_click_token = signal_token
+                st.session_state.last_chart_click_at = now_monotonic
 
     latest_signal = st.session_state.latest_signal
     signal_chip_html = "<div class='signal-chip-placeholder'></div>"
