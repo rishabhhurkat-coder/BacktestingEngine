@@ -1154,12 +1154,83 @@ def normalize_saved_signals_df(raw_df: pd.DataFrame, symbol: str) -> pd.DataFram
     return safe_df
 
 
-def load_saved_signals_file(csv_path: Path, symbol: str) -> list[dict[str, Any]]:
+def normalize_trade_export_to_saved_signals_df(
+    raw_df: pd.DataFrame,
+    symbol: str,
+    input_df: pd.DataFrame,
+) -> pd.DataFrame:
+    safe_df = raw_df.copy()
+    safe_df.columns = safe_df.columns.str.strip()
+    required = ["Date", "Time", "Trade"]
+    missing = [column for column in required if column not in safe_df.columns]
+    if missing:
+        raise ValueError(f"Missing required trade-export columns: {', '.join(missing)}")
+
+    lookup_df = input_df.copy()
+    lookup_df["LookupKey"] = (
+        lookup_df["DateLabel"].astype(str).str.strip()
+        + "|"
+        + lookup_df["TimeLabel"].astype(str).str.strip()
+    )
+    lookup_df = lookup_df.drop_duplicates(subset=["LookupKey"], keep="last")
+    lookup = lookup_df.set_index("LookupKey")
+
+    records: list[dict[str, Any]] = []
+    for _, row in safe_df.iterrows():
+        date_label = str(row.get("Date") or "").strip()
+        try:
+            time_label = normalize_time(row.get("Time"))
+        except Exception:
+            continue
+        trade_value = str(row.get("Trade") or "").strip().upper()
+        signal = {"B": "BUY", "S": "SELL", "BUY": "BUY", "SELL": "SELL"}.get(trade_value)
+        if not signal:
+            continue
+
+        lookup_key = f"{date_label}|{time_label}"
+        if lookup_key not in lookup.index:
+            continue
+        candle = lookup.loc[lookup_key]
+        qty_raw = row.get("Qty", 1)
+        try:
+            qty = int(float(qty_raw))
+        except (TypeError, ValueError):
+            qty = 1
+
+        records.append(
+            {
+                "Symbol": symbol,
+                "Date": str(candle["DateLabel"]),
+                "Time": str(candle["TimeLabel"]),
+                "Open": float(candle["Open"]),
+                "High": float(candle["High"]),
+                "Low": float(candle["Low"]),
+                "Close": float(candle["Close"]),
+                "EMA": float(candle["EMA"]),
+                "Signal": signal,
+                "Qty": qty,
+                "TimeChart": str(candle["TimeChart"]),
+                "TimeEpoch": int(candle["TimeEpoch"]),
+                "SignalKey": str(candle["SignalKey"]),
+            }
+        )
+
+    if not records:
+        return empty_saved_signals_df()
+    return normalize_saved_signals_df(pd.DataFrame(records), symbol)
+
+
+def load_saved_signals_file(csv_path: Path, symbol: str, input_df: pd.DataFrame | None = None) -> list[dict[str, Any]]:
     if not csv_path.exists() or csv_path.stat().st_size == 0:
         return []
 
     raw_df = read_tabular_file(csv_path)
-    normalized_df = normalize_saved_signals_df(raw_df, symbol)
+    try:
+        normalized_df = normalize_saved_signals_df(raw_df, symbol)
+    except ValueError:
+        if input_df is None:
+            raise
+        normalized_df = normalize_trade_export_to_saved_signals_df(raw_df, symbol, input_df)
     return normalized_df.to_dict("records")
 
 
@@ -2264,6 +2335,8 @@ def main() -> None:
             format_func=display_symbol,
         )
 
+    df = load_data(symbols[symbol])
+
     output_csv_path = output_signal_csv_path(output_dir, symbol)
     if (
         st.session_state.get("saved_signals_symbol") != symbol
@@ -2271,7 +2344,7 @@ def main() -> None:
     ):
         try:
             ensure_output_signal_file(output_dir, symbol)
-            loaded_saved_signals = load_saved_signals_file(output_csv_path, symbol)
+            loaded_saved_signals = load_saved_signals_file(output_csv_path, symbol, input_df=df)
             persisted_saved_signals = persist_saved_signals_file(output_csv_path, symbol, loaded_saved_signals)
         except Exception as exc:
             st.error(f"Saved-signal file error for {symbol}: {exc}")
@@ -2286,8 +2359,6 @@ def main() -> None:
     )
     input_download_path = Path(symbols[symbol])
     input_download_bytes = read_file_bytes(input_download_path)
-
-    df = load_data(symbols[symbol])
 
     min_date = df["Date"].dt.date.min()
     max_date = df["Date"].dt.date.max()
