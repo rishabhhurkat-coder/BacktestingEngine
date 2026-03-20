@@ -706,7 +706,10 @@ def build_trade_table_download_bytes(
     if trade_df.empty:
         return None
 
+    trade_df.insert(0, "Scrip", symbol)
+
     export_columns = [
+        "Scrip",
         "Sr.No",
         "Date",
         "Time",
