@@ -51,7 +51,8 @@ TIMEFRAME_LABEL = "3m"
 SESSION_START = "09.15"
 SESSION_END = "15.27"
 CHART_HEIGHT = 700
-SUPPORTED_DATA_EXTENSIONS = (".csv", ".xlsx", ".xlsm")
+SUPPORTED_DATA_EXTENSIONS = (".csv", ".xlsx", ".xlsm", ".xlsb")
+UPLOAD_DATA_TYPES = ["csv", "xlsx", "xlsm", "xlsb"]
 SAVED_SIGNAL_COLUMNS = [
     "Symbol",
     "Date",
@@ -153,11 +154,17 @@ def list_supported_data_files(folder: Path) -> list[Path]:
 
 def read_tabular_file(file_path: Path) -> pd.DataFrame:
     suffix = file_path.suffix.lower()
+    return read_tabular_source(file_path, suffix)
+
+
+def read_tabular_source(source: Any, suffix: str) -> pd.DataFrame:
     if suffix == ".csv":
-        return pd.read_csv(file_path)
+        return pd.read_csv(source)
     if suffix in {".xlsx", ".xlsm"}:
-        return pd.read_excel(file_path)
-    raise ValueError(f"Unsupported file type: {file_path.suffix}")
+        return pd.read_excel(source)
+    if suffix == ".xlsb":
+        return pd.read_excel(source, engine="pyxlsb")
+    raise ValueError(f"Unsupported file type: {suffix}")
 
 
 def write_tabular_file(df: pd.DataFrame, file_path: Path) -> None:
@@ -180,10 +187,30 @@ def find_data_file_by_stem(folder: Path, stem: str) -> Path | None:
     return None
 
 
+def csv_path_for_stem(folder: Path, stem: str) -> Path:
+    return folder / f"{stem}.csv"
+
+
+def remove_other_matching_data_files(folder: Path, stem: str, keep_path: Path) -> None:
+    stem_lookup = stem.casefold()
+    keep_name = keep_path.name.casefold()
+    for file_path in list_supported_data_files(folder):
+        if file_path.stem.casefold() != stem_lookup:
+            continue
+        if file_path.name.casefold() == keep_name:
+            continue
+        try:
+            file_path.unlink()
+        except OSError:
+            continue
+
+
 def tabular_mime_type(file_path: Path) -> str:
     suffix = file_path.suffix.lower()
     if suffix == ".csv":
         return "text/csv"
+    if suffix == ".xlsb":
+        return "application/vnd.ms-excel.sheet.binary.macroEnabled.12"
     return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
@@ -493,7 +520,7 @@ def ensure_workspace_dirs(main_dir: Path) -> tuple[Path, Path, Path]:
     return raw_dir, input_dir, output_dir
 
 
-def clear_csv_files(folder: Path) -> None:
+def clear_supported_data_files(folder: Path) -> None:
     for file_path in list_supported_data_files(folder):
         try:
             file_path.unlink()
@@ -509,16 +536,34 @@ def build_upload_signature(uploaded_files: list[Any]) -> tuple[tuple[str, int], 
     return tuple(sorted(signature))
 
 
-def folder_has_csvs(folder: Path) -> bool:
+def folder_has_supported_data_files(folder: Path) -> bool:
     return bool(list_supported_data_files(folder))
 
 
-def sync_uploaded_csv_folder(uploaded_files: list[Any], target_dir: Path) -> int:
+def sync_uploaded_data_folder(uploaded_files: list[Any], target_dir: Path) -> int:
+    return sync_uploaded_data_folder_as(uploaded_files, target_dir, convert_to_csv=False)
+
+
+def sync_uploaded_data_folder_as(
+    uploaded_files: list[Any],
+    target_dir: Path,
+    *,
+    convert_to_csv: bool,
+) -> int:
     target_dir.mkdir(parents=True, exist_ok=True)
-    clear_csv_files(target_dir)
+    clear_supported_data_files(target_dir)
     for uploaded_file in uploaded_files:
-        target_path = target_dir / Path(str(uploaded_file.name)).name
-        target_path.write_bytes(uploaded_file.getbuffer())
+        uploaded_name = Path(str(uploaded_file.name)).name
+        if convert_to_csv:
+            target_path = csv_path_for_stem(target_dir, Path(uploaded_name).stem)
+            uploaded_df = read_tabular_source(
+                io.BytesIO(uploaded_file.getbuffer()),
+                Path(uploaded_name).suffix.lower(),
+            )
+            write_tabular_file(uploaded_df, target_path)
+        else:
+            target_path = target_dir / uploaded_name
+            target_path.write_bytes(uploaded_file.getbuffer())
     return len(uploaded_files)
 
 
@@ -545,14 +590,16 @@ def normalize_processed_input_df(raw_df: pd.DataFrame) -> pd.DataFrame:
 def merge_processed_input_dirs(existing_input_dir: Path, new_input_dir: Path) -> None:
     existing_input_dir.mkdir(parents=True, exist_ok=True)
     for new_csv_path in list_supported_data_files(new_input_dir):
-        target_csv_path = find_data_file_by_stem(existing_input_dir, new_csv_path.stem) or (existing_input_dir / new_csv_path.name)
+        existing_path = find_data_file_by_stem(existing_input_dir, new_csv_path.stem)
+        target_csv_path = csv_path_for_stem(existing_input_dir, new_csv_path.stem)
         new_df = normalize_processed_input_df(read_tabular_file(new_csv_path))
-        if target_csv_path.exists():
-            existing_df = normalize_processed_input_df(read_tabular_file(target_csv_path))
+        if existing_path and existing_path.exists():
+            existing_df = normalize_processed_input_df(read_tabular_file(existing_path))
             merged_df = normalize_processed_input_df(pd.concat([existing_df, new_df], ignore_index=True))
         else:
             merged_df = new_df
         write_tabular_file(merged_df.drop(columns=["DateObj"], errors="ignore"), target_csv_path)
+        remove_other_matching_data_files(existing_input_dir, new_csv_path.stem, target_csv_path)
 
 
 def process_cloud_uploaded_files(
@@ -567,15 +614,15 @@ def process_cloud_uploaded_files(
     level = "success"
 
     if uploaded_output_files:
-        sync_uploaded_csv_folder(uploaded_output_files, output_dir)
-        messages.append(f"Loaded {len(uploaded_output_files)} output file(s)")
+        sync_uploaded_data_folder_as(uploaded_output_files, output_dir, convert_to_csv=True)
+        messages.append(f"Loaded {len(uploaded_output_files)} output file(s) as CSV")
 
     if uploaded_input_files:
-        sync_uploaded_csv_folder(uploaded_input_files, input_dir)
-        messages.append(f"Loaded {len(uploaded_input_files)} input file(s)")
+        sync_uploaded_data_folder_as(uploaded_input_files, input_dir, convert_to_csv=True)
+        messages.append(f"Loaded {len(uploaded_input_files)} input file(s) as CSV")
 
     if uploaded_raw_files:
-        sync_uploaded_csv_folder(uploaded_raw_files, raw_dir)
+        sync_uploaded_data_folder(uploaded_raw_files, raw_dir)
         messages.append(f"Loaded {len(uploaded_raw_files)} raw file(s)")
 
         if process_uploaded_input or not uploaded_input_files:
@@ -586,7 +633,7 @@ def process_cloud_uploaded_files(
                     merge_processed_input_dirs(input_dir, temp_processed_dir)
                     messages.append("Merged processed raw files with uploaded input files")
                 else:
-                    clear_csv_files(input_dir)
+                    clear_supported_data_files(input_dir)
                     merge_processed_input_dirs(input_dir, temp_processed_dir)
                 summary_level, summary_message = build_processing_feedback(summary)
                 if summary_level == "warning" and level == "success":
@@ -605,9 +652,9 @@ def process_cloud_uploaded_files(
                 except OSError:
                     pass
         else:
-            messages.append("Using uploaded input files as-is")
+            messages.append("Using uploaded input files as CSV")
     elif uploaded_input_files:
-        messages.append("Using uploaded input files as-is")
+        messages.append("Using uploaded input files as CSV")
 
     if not messages:
         return "warning", "No files were uploaded."
@@ -616,8 +663,8 @@ def process_cloud_uploaded_files(
 
 def sync_uploaded_raw_files(uploaded_files: list[Any], main_dir: Path) -> tuple[str, str]:
     raw_dir, input_dir, _ = ensure_workspace_dirs(main_dir)
-    clear_csv_files(raw_dir)
-    clear_csv_files(input_dir)
+    clear_supported_data_files(raw_dir)
+    clear_supported_data_files(input_dir)
 
     for uploaded_file in uploaded_files:
         target_path = raw_dir / Path(str(uploaded_file.name)).name
@@ -650,19 +697,19 @@ def render_cloud_upload_dialog(main_dir: Path) -> None:
     st.caption("Upload any combination of raw, input, and output folders.")
     uploaded_raw_files = st.file_uploader(
         "Upload Raw Files Folder",
-        type=["csv", "xlsx", "xlsm"],
+        type=UPLOAD_DATA_TYPES,
         accept_multiple_files="directory",
         key=f"cloud_raw_uploads_{st.session_state.cloud_uploader_nonce}",
     )
     uploaded_input_files = st.file_uploader(
         "Upload Input Files Folder",
-        type=["csv", "xlsx", "xlsm"],
+        type=UPLOAD_DATA_TYPES,
         accept_multiple_files="directory",
         key=f"cloud_input_uploads_{st.session_state.cloud_input_uploader_nonce}",
     )
     uploaded_output_files = st.file_uploader(
         "Upload Output Files Folder",
-        type=["csv", "xlsx", "xlsm"],
+        type=UPLOAD_DATA_TYPES,
         accept_multiple_files="directory",
         key=f"cloud_output_uploads_{st.session_state.cloud_output_uploader_nonce}",
     )
@@ -742,12 +789,18 @@ def empty_saved_signals_df() -> pd.DataFrame:
 
 
 def output_signal_csv_path(output_dir: Path, symbol: str) -> Path:
-    return find_data_file_by_stem(output_dir, symbol) or (output_dir / f"{symbol}.csv")
+    return csv_path_for_stem(output_dir, symbol)
 
 
 def ensure_output_signal_file(output_dir: Path, symbol: str) -> Path:
     csv_path = output_signal_csv_path(output_dir, symbol)
-    if not csv_path.exists():
+    existing_path = find_data_file_by_stem(output_dir, symbol)
+    if existing_path and existing_path.exists() and existing_path != csv_path:
+        raw_df = read_tabular_file(existing_path)
+        normalized_df = normalize_saved_signals_df(raw_df, symbol)
+        write_tabular_file(normalized_df, csv_path)
+        remove_other_matching_data_files(output_dir, symbol, csv_path)
+    elif not csv_path.exists():
         write_tabular_file(empty_saved_signals_df(), csv_path)
     return csv_path
 
@@ -1664,7 +1717,7 @@ def main() -> None:
                         st.rerun()
             else:
                 raw_dir, input_dir, output_dir = ensure_workspace_dirs(cloud_workspace_dir)
-                has_processed_input_files = folder_has_csvs(input_dir)
+                has_processed_input_files = folder_has_supported_data_files(input_dir)
                 st.session_state.main_dir_path_input = str(cloud_workspace_dir)
                 st.session_state.data_dir_path_input = str(input_dir)
                 st.session_state.output_dir_path_input = str(output_dir)
@@ -1676,9 +1729,9 @@ def main() -> None:
                     st.rerun()
 
                 if st.button("Reset Uploaded Files", use_container_width=True):
-                    clear_csv_files(raw_dir)
-                    clear_csv_files(input_dir)
-                    clear_csv_files(output_dir)
+                    clear_supported_data_files(raw_dir)
+                    clear_supported_data_files(input_dir)
+                    clear_supported_data_files(output_dir)
                     st.session_state.cloud_raw_upload_signature = ()
                     st.session_state.cloud_uploader_nonce += 1
                     st.session_state.cloud_input_uploader_nonce += 1
@@ -1788,10 +1841,10 @@ def main() -> None:
     if not symbols:
         raw_symbols = list_supported_data_files(raw_dir)
         if raw_symbols:
-            st.error("No processed CSV files found in Input Files. Click Process Input Files.")
+            st.error("No processed supported data files found in Input Files. Click Process Input Files.")
         else:
             if is_windows:
-                st.error(f"No raw CSV files found in {raw_dir}")
+                st.error(f"No raw supported data files found in {raw_dir}")
             else:
                 st.info("Select your raw-files folder from your computer to begin.")
         return

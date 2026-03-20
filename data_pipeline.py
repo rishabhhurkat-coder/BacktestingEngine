@@ -8,7 +8,7 @@ import pandas as pd
 
 DATE_OUTPUT_FORMAT = "%d-%b-%y"
 TIME_OUTPUT_FORMAT = "%H.%M"
-SUPPORTED_DATA_EXTENSIONS = (".csv", ".xlsx", ".xlsm")
+SUPPORTED_DATA_EXTENSIONS = (".csv", ".xlsx", ".xlsm", ".xlsb")
 
 
 @dataclass
@@ -53,6 +53,8 @@ def read_tabular_file(file_path: Path) -> pd.DataFrame:
         return pd.read_csv(file_path)
     if suffix in {".xlsx", ".xlsm"}:
         return pd.read_excel(file_path)
+    if suffix == ".xlsb":
+        return pd.read_excel(file_path, engine="pyxlsb")
     raise ValueError(f"Unsupported file type: {file_path.suffix}")
 
 
@@ -84,7 +86,7 @@ def clean_symbol(files: list[Path]) -> pd.DataFrame:
     df = df.rename(columns=normalized_columns)
 
     if "time" not in df.columns:
-        raise ValueError("Column 'time' not found in selected CSV")
+        raise ValueError("Column 'time' not found in selected data file")
 
     df["time"] = pd.to_datetime(df["time"], errors="coerce")
     df = df.dropna(subset=["time"]).sort_values("time", kind="stable")
@@ -165,7 +167,7 @@ def process_raw_folder(raw_dir: Path, input_dir: Path) -> ProcessingSummary:
 
     symbol_files = list_raw_symbols(raw_dir)
     if not symbol_files:
-        return ProcessingSummary(processed=[], skipped=[], errors=["No raw CSV files found."])
+        return ProcessingSummary(processed=[], skipped=[], errors=["No raw supported data files found."])
 
     processed: list[ProcessedSymbolResult] = []
     skipped: list[ProcessedSymbolResult] = []
