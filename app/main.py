@@ -888,16 +888,29 @@ def sync_google_drive_input_files_to_dir(
         return "warning", "Google Drive Input Files are not connected yet.", 0
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    drive_input_files = filter_supported_google_drive_files(
-        list_google_drive_folder_files(drive_status.input_folder.folder_id)
-    )
+    try:
+        drive_input_files = filter_supported_google_drive_files(
+            list_google_drive_folder_files(drive_status.input_folder.folder_id)
+        )
+    except Exception as exc:
+        return "error", f"Could not read Google Drive Input Files: {exc}", 0
+
     if not drive_input_files:
         clear_supported_data_files(target_dir)
         return "warning", "No supported files were found in Google Drive Input Files.", 0
 
-    clear_supported_data_files(target_dir)
-    download_google_drive_files_to_dir(drive_input_files, target_dir)
-    return "success", f"Loaded {len(drive_input_files)} input file(s) from Google Drive.", len(drive_input_files)
+    temp_dir = Path(tempfile.mkdtemp(prefix="ema_drive_input_sync_"))
+    try:
+        download_google_drive_files_to_dir(drive_input_files, temp_dir)
+        clear_supported_data_files(target_dir)
+        for downloaded_path in list_supported_data_files(temp_dir):
+            target_path = target_dir / downloaded_path.name
+            target_path.write_bytes(downloaded_path.read_bytes())
+        return "success", f"Loaded {len(drive_input_files)} input file(s) from Google Drive.", len(drive_input_files)
+    except Exception as exc:
+        return "error", f"Could not sync Google Drive Input Files: {exc}", 0
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def sync_google_drive_output_files_to_dir(
@@ -908,15 +921,29 @@ def sync_google_drive_output_files_to_dir(
         return "warning", "Google Drive Output Files are not connected yet.", 0
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    drive_output_files = filter_supported_google_drive_files(
-        list_google_drive_folder_files(drive_status.output_folder.folder_id)
-    )
-    clear_supported_data_files(target_dir)
+    try:
+        drive_output_files = filter_supported_google_drive_files(
+            list_google_drive_folder_files(drive_status.output_folder.folder_id)
+        )
+    except Exception as exc:
+        return "error", f"Could not read Google Drive Output Files: {exc}", 0
+
     if not drive_output_files:
+        clear_supported_data_files(target_dir)
         return "success", "No saved output files were found in Google Drive Output Files.", 0
 
-    download_google_drive_files_to_dir(drive_output_files, target_dir)
-    return "success", f"Loaded {len(drive_output_files)} output file(s) from Google Drive.", len(drive_output_files)
+    temp_dir = Path(tempfile.mkdtemp(prefix="ema_drive_output_sync_"))
+    try:
+        download_google_drive_files_to_dir(drive_output_files, temp_dir)
+        clear_supported_data_files(target_dir)
+        for downloaded_path in list_supported_data_files(temp_dir):
+            target_path = target_dir / downloaded_path.name
+            target_path.write_bytes(downloaded_path.read_bytes())
+        return "success", f"Loaded {len(drive_output_files)} output file(s) from Google Drive.", len(drive_output_files)
+    except Exception as exc:
+        return "error", f"Could not sync Google Drive Output Files: {exc}", 0
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def reload_selected_drive_output_for_symbol(
@@ -2067,17 +2094,21 @@ def main() -> None:
                 st.session_state.data_dir_path_input = str(input_dir)
                 st.session_state.output_dir_path_input = str(output_dir)
                 if drive_status.connected and not st.session_state.get("drive_output_sync_completed"):
-                    _, _, output_count = sync_google_drive_output_files_to_dir(drive_status, output_dir)
-                    st.session_state.drive_output_sync_completed = True
-                    if output_count:
-                        st.session_state.saved_signals = []
-                        st.session_state.saved_signals_symbol = None
-                        st.session_state.saved_signals_output_csv = None
-                        st.session_state.latest_signal = None
-                    list_google_drive_folder_files.clear()
-                    list_symbols.clear()
-                    load_data.clear()
-                    st.rerun()
+                    output_level, output_message, output_count = sync_google_drive_output_files_to_dir(drive_status, output_dir)
+                    if output_level == "error":
+                        st.session_state.process_feedback_level = "error"
+                        st.session_state.process_feedback_message = output_message
+                    else:
+                        st.session_state.drive_output_sync_completed = True
+                        if output_count:
+                            st.session_state.saved_signals = []
+                            st.session_state.saved_signals_symbol = None
+                            st.session_state.saved_signals_output_csv = None
+                            st.session_state.latest_signal = None
+                        list_google_drive_folder_files.clear()
+                        list_symbols.clear()
+                        load_data.clear()
+                        st.rerun()
                 if (
                     drive_status.connected
                     and drive_raw_files
@@ -2089,10 +2120,11 @@ def main() -> None:
                     st.session_state.process_feedback_message = message
                     st.session_state.drive_input_sync_choice = "No"
                     st.session_state.drive_input_sync_file_count = file_count
-                    list_google_drive_folder_files.clear()
-                    list_symbols.clear()
-                    load_data.clear()
-                    st.rerun()
+                    if level != "error":
+                        list_google_drive_folder_files.clear()
+                        list_symbols.clear()
+                        load_data.clear()
+                        st.rerun()
 
             if is_windows:
                 if st.button("Process Input Files", use_container_width=True):
