@@ -270,6 +270,8 @@ const Chart = ({
   const hasFitRef = useRef(false);
   const isReadyRef = useRef(false);
   const zoomedStateRef = useRef(false);
+  const pendingClickTimerRef = useRef<number | null>(null);
+  const pendingClickEpochRef = useRef<UTCTimestamp | null>(null);
 
   const [modalMode, setModalMode] = useState<ModalMode>(null);
   const [dateValue, setDateValue] = useState("");
@@ -628,7 +630,35 @@ const Chart = ({
       if (clicked === null) {
         return;
       }
-      emitComponentEvent({ eventType: "chart_click", epoch: clicked });
+
+      if (
+        pendingClickTimerRef.current !== null &&
+        pendingClickEpochRef.current === clicked
+      ) {
+        window.clearTimeout(pendingClickTimerRef.current);
+        pendingClickTimerRef.current = null;
+        pendingClickEpochRef.current = null;
+        emitComponentEvent({ eventType: "chart_double_click", epoch: clicked });
+        return;
+      }
+
+      if (
+        pendingClickTimerRef.current !== null &&
+        pendingClickEpochRef.current !== null
+      ) {
+        window.clearTimeout(pendingClickTimerRef.current);
+        emitComponentEvent({
+          eventType: "chart_click",
+          epoch: pendingClickEpochRef.current,
+        });
+      }
+
+      pendingClickEpochRef.current = clicked;
+      pendingClickTimerRef.current = window.setTimeout(() => {
+        emitComponentEvent({ eventType: "chart_click", epoch: clicked });
+        pendingClickTimerRef.current = null;
+        pendingClickEpochRef.current = null;
+      }, 250);
     });
 
     chartRef.current = chart;
@@ -683,6 +713,11 @@ const Chart = ({
       window.removeEventListener("keydown", handleKeyDown);
       document.removeEventListener("keydown", handleKeyDown);
       container.removeEventListener("click", handleFocusClick);
+      if (pendingClickTimerRef.current !== null) {
+        window.clearTimeout(pendingClickTimerRef.current);
+        pendingClickTimerRef.current = null;
+        pendingClickEpochRef.current = null;
+      }
       chart.timeScale().unsubscribeVisibleTimeRangeChange(handleVisibleRangeChange);
       chart.remove();
       chartRef.current = null;

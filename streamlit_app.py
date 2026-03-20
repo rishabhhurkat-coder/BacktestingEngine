@@ -1055,6 +1055,28 @@ def save_signal(signal_record: dict[str, Any], output_csv_path: Path) -> bool:
     return True
 
 
+def remove_signal(signal_record: dict[str, Any], output_csv_path: Path) -> bool:
+    existing_keys = {item["SignalKey"] for item in st.session_state.saved_signals}
+    if signal_record["SignalKey"] not in existing_keys:
+        return False
+
+    updated_signals = [
+        item for item in st.session_state.saved_signals
+        if item["SignalKey"] != signal_record["SignalKey"]
+    ]
+    try:
+        persisted_signals = persist_saved_signals_file(
+            output_csv_path,
+            signal_record["Symbol"],
+            updated_signals,
+        )
+    except Exception as exc:
+        st.error(f"Could not update saved-signal file: {exc}")
+        return False
+    apply_saved_signals_state(persisted_signals, signal_record["Symbol"], output_csv_path)
+    return True
+
+
 def build_markers(symbol: str) -> list[dict[str, Any]]:
     markers: list[dict[str, Any]] = []
     for item in st.session_state.saved_signals:
@@ -2040,6 +2062,7 @@ def main() -> None:
 
     # --- CHART CLICK LOGIC ---
     if chart_event:
+        chart_event_type = chart_event.get("eventType") if isinstance(chart_event, dict) else None
 
         if isinstance(chart_event, dict):
             if "zoomed" in chart_event:
@@ -2067,7 +2090,10 @@ def main() -> None:
             }
 
             signal_record = build_signal_record(symbol, clicked_row)
-            save_signal(signal_record, output_csv_path)
+            if chart_event_type == "chart_double_click":
+                remove_signal(signal_record, output_csv_path)
+            else:
+                save_signal(signal_record, output_csv_path)
 
     latest_signal = st.session_state.latest_signal
     signal_chip_html = "<div class='signal-chip-placeholder'></div>"
