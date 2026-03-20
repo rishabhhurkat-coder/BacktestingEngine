@@ -1554,6 +1554,7 @@ def main() -> None:
     st.session_state.setdefault("filter_source_to", None)
     st.session_state.setdefault("chart_zoomed", False)
     st.session_state.setdefault("main_dir_path_input", "")
+    st.session_state.setdefault("main_dir_path_display", "")
     st.session_state.setdefault("data_dir_path_input", "")
     st.session_state.setdefault("output_dir_path_input", "")
     st.session_state.setdefault("process_feedback_level", None)
@@ -1740,6 +1741,16 @@ def main() -> None:
                     list_symbols.clear()
                     load_data.clear()
                     st.rerun()
+
+            st.session_state.main_dir_path_display = str(
+                st.session_state.get("main_dir_path_input") or ""
+            ).strip()
+            st.text_input(
+                "Selected Main Folder Path",
+                key="main_dir_path_display",
+                disabled=True,
+                placeholder="No folder selected yet",
+            )
 
             if is_windows:
                 if st.button("Process Input Files", use_container_width=True):
