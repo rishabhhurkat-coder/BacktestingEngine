@@ -11,8 +11,8 @@ def _resolve_build_dir() -> Path:
     if env_path:
         candidates.append(Path(env_path))
 
-    candidates.append(Path("C:/tv_chart_component/frontend/build"))
     candidates.append(Path(__file__).parent / "tv_chart_component" / "frontend" / "build")
+    candidates.append(Path("C:/tv_chart_component/frontend/build"))
 
     for candidate in candidates:
         if (candidate / "index.html").exists():

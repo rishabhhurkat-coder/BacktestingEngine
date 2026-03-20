@@ -187,6 +187,25 @@ def tabular_mime_type(file_path: Path) -> str:
     return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
+def normalize_chart_replay_state(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {"active": False, "index": None, "showStartLine": False}
+
+    active = bool(value.get("active"))
+    raw_index = value.get("index")
+    try:
+        index = None if raw_index is None else max(0, int(raw_index))
+    except (TypeError, ValueError):
+        index = None
+
+    show_start_line = active and bool(value.get("showStartLine"))
+    return {
+        "active": active,
+        "index": index if active else None,
+        "showStartLine": show_start_line,
+    }
+
+
 @st.cache_data(show_spinner=False)
 def list_symbols(data_dir: str) -> dict[str, str]:
     folder = Path(data_dir)
@@ -1464,6 +1483,10 @@ def main() -> None:
     st.session_state.setdefault("clicked_date", None)
     st.session_state.setdefault("clicked_time", None)
     st.session_state.setdefault("clicked_epoch", None)
+    st.session_state.setdefault(
+        "chart_replay_state",
+        {"active": False, "index": None, "showStartLine": False},
+    )
     st.session_state.setdefault("show_filters", True)
     st.session_state.setdefault("confirm_clear_all", False)
     st.session_state.setdefault("saved_signals_selected_row", None)
@@ -1957,6 +1980,7 @@ def main() -> None:
             candles=candle_data,
             ema=ema_data,
             markers=build_markers(symbol),
+            replayState=normalize_chart_replay_state(st.session_state.get("chart_replay_state")),
             key=f"tv-lite-{symbol}-{st.session_state.chart_reset_nonce}-{build_signature}",
             height=CHART_HEIGHT,
         )
@@ -1964,8 +1988,13 @@ def main() -> None:
     # --- CHART CLICK LOGIC ---
     if chart_event:
 
-        if isinstance(chart_event, dict) and "zoomed" in chart_event:
-            st.session_state.chart_zoomed = bool(chart_event.get("zoomed"))
+        if isinstance(chart_event, dict):
+            if "zoomed" in chart_event:
+                st.session_state.chart_zoomed = bool(chart_event.get("zoomed"))
+            if "replayState" in chart_event:
+                st.session_state.chart_replay_state = normalize_chart_replay_state(
+                    chart_event.get("replayState")
+                )
         clicked_row = parse_clicked_row(chart_event, chart_df)
 
         if clicked_row is not None:

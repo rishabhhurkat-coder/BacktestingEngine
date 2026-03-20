@@ -8,14 +8,20 @@ type StreamlitArgs = {
   ema?: EmaPoint[];
   markers?: Marker[];
   height?: number;
+  replayState?: {
+    active?: boolean;
+    index?: number | null;
+    showStartLine?: boolean;
+  } | null;
 };
 
-const App = (props: any): JSX.Element => {
+const App = (props: any): React.ReactElement => {
   const args = (props?.args ?? {}) as StreamlitArgs;
   const candles = args.candles ?? [];
   const ema = args.ema ?? [];
   const markers = args.markers ?? [];
   const height = args.height ?? 600;
+  const replayState = args.replayState ?? null;
 
   return (
     <Chart
@@ -23,6 +29,7 @@ const App = (props: any): JSX.Element => {
       ema={ema}
       markers={markers}
       height={height}
+      replayState={replayState}
     />
   );
 };
