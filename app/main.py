@@ -3191,11 +3191,12 @@ def style_dashboard_chart(fig, *, height: int = 360, xaxis_title: str = "", yaxi
         fig.update_layout(hovermode=hovermode)
     fig.update_xaxes(showgrid=False, zeroline=False)
     fig.update_yaxes(showgrid=True, gridcolor="rgba(148,163,184,0.18)", zeroline=False)
-    fig.update_traces(marker_line_width=0)
     for trace in fig.data:
         trace_type = getattr(trace, "type", "")
         if trace_type == "bar":
             trace.opacity = 0.9
+            if hasattr(trace, "marker") and getattr(trace.marker, "line", None) is not None:
+                trace.marker.line.width = 0
         elif trace_type == "scatter":
             if hasattr(trace, "line"):
                 trace.line.width = 3
