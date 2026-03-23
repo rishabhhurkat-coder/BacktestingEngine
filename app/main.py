@@ -1773,14 +1773,14 @@ def build_saved_signals_trade_table(
     return trade_df
 
 
-def _table_height_for_rows(row_count: int, min_height: int = 180) -> int:
+def _table_height_for_rows(row_count: int, min_height: int = 180, max_height: int = 360) -> int:
     header_height = 32
     row_height = 32
     padding = 12
     if row_count <= 0:
         return 120
     height = header_height + (row_height * row_count) + padding
-    return min(CHART_HEIGHT, height)
+    return min(max_height, height)
 
 
 def _concat_non_empty_frames(frames: list[pd.DataFrame], *, fallback_columns: list[str] | None = None) -> pd.DataFrame:
@@ -3709,10 +3709,12 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
     )
     active_scrip_count = int(preview_filtered_df["Scrip"].nunique()) if not preview_filtered_df.empty else len(selected_dashboard_scrips)
     selected_scrips_text = select_all_label if len(selected_dashboard_scrips) == len(available_scrips) else ", ".join(display_symbol(scrip) for scrip in selected_dashboard_scrips)
-    input_header_col, input_popover_col = st.columns([0.75, 0.25])
+    input_header_col, export_button_col, input_popover_col = st.columns([0.52, 0.24, 0.24])
     with input_header_col:
         if prop_dashboard_enabled:
             st.caption("Prop mode deducts estimated charges on every trade and monthly interest from the net profit calculations.")
+    with export_button_col:
+        dashboard_export_placeholder = st.empty()
     with input_popover_col:
         with st.popover("Dashboard Inputs"):
             estimated_charges_per_trade = st.number_input(
@@ -3993,24 +3995,21 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
         trade_details_df=detail_display_df,
         equity_df=equity_export_df,
     )
+    dashboard_export_placeholder.download_button(
+        "Export Dashboard to Excel",
+        data=dashboard_excel_bytes,
+        file_name=f"dashboard_{'prop' if prop_dashboard_enabled else 'regular'}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        width="stretch",
+        key=f"dashboard-excel-export-{'prop' if prop_dashboard_enabled else 'regular'}",
+    )
 
     with st.container():
         summary_display_df = summary_df.rename(columns={"Total PL Amt": "Total Profit / Loss"})
         top_chart_specs, lower_chart_specs = build_single_dashboard_chart_specs(summary_df, filtered_df, metrics)
-        header_col, export_col = st.columns([0.7, 0.3])
-        with header_col:
-            render_dashboard_section_header(
-                "KPI Overview",
-            )
-        with export_col:
-            st.download_button(
-                "Export Dashboard to Excel",
-                data=dashboard_excel_bytes,
-                file_name=f"dashboard_{'prop' if prop_dashboard_enabled else 'regular'}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                width="stretch",
-                key=f"dashboard-excel-export-{'prop' if prop_dashboard_enabled else 'regular'}",
-            )
+        render_dashboard_section_header(
+            "KPI Overview",
+        )
         metric_row_1 = st.columns(3)
         render_dashboard_box(metric_row_1[0], "Total Scrips", metrics["total_scrips"])
         render_dashboard_box(metric_row_1[1], "Total PL", metrics["total_pl_amt"], force_green=metrics["total_pl_amt"] > 0)
