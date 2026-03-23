@@ -2670,8 +2670,7 @@ def build_strategy_dashboard_chart_specs(comparison_df: pd.DataFrame, strategy_e
     return overview, detailed
 
 
-@st.dialog("Detailed Charts", width="large")
-def render_detailed_charts_dialog(title: str, chart_specs: list[tuple[str, Any]]) -> None:
+def render_detailed_charts_panel(title: str, chart_specs: list[tuple[str, Any]]) -> None:
     st.markdown(
         """
         <style>
@@ -2686,13 +2685,22 @@ def render_detailed_charts_dialog(title: str, chart_specs: list[tuple[str, Any]]
         """,
         unsafe_allow_html=True,
     )
-    st.markdown(f"### {title}")
-    for chart_title, fig in chart_specs:
-        st.markdown(f"#### {chart_title}")
-        if fig is None:
-            st.info("No data available")
-        else:
-            st.plotly_chart(fig, use_container_width=True)
+    header_col, close_col = st.columns([0.82, 0.18])
+    with header_col:
+        st.markdown(f"### {title}")
+    with close_col:
+        if st.button("Close Detailed View", key=f"close-{title}"):
+            st.session_state["dashboard_chart_focus"] = None
+            st.rerun()
+    for index in range(0, len(chart_specs), 2):
+        row_cols = st.columns(2)
+        for cell, (chart_title, fig) in zip(row_cols, chart_specs[index:index + 2]):
+            with cell:
+                st.markdown(f"#### {chart_title}")
+                if fig is None:
+                    st.info("No data available")
+                else:
+                    st.plotly_chart(fig, use_container_width=True)
 
 
 def build_strategy_comparison_dashboard(
@@ -2747,6 +2755,7 @@ def build_strategy_comparison_dashboard(
 def render_interactive_output_dashboard(output_dir: Path) -> None:
     st.markdown(CARD_STYLE, unsafe_allow_html=True)
     st.caption(f"Interactive dashboard based on the current Output Files folder: {output_dir}")
+    chart_focus_mode = st.session_state.get("dashboard_chart_focus")
     root_signature = dashboard_folder_signature(output_dir)
     strategy_dirs = dashboard_strategy_dirs(output_dir)
     strategy_mode_enabled = st.toggle(
@@ -2831,6 +2840,10 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
         if comparison_df.empty:
             st.warning("No data available")
             return
+        if chart_focus_mode == "strategy":
+            _, detailed_chart_specs = build_strategy_dashboard_chart_specs(comparison_df, strategy_equity_df)
+            render_detailed_charts_panel("Strategy Comparison Charts", detailed_chart_specs)
+            return
 
         with st.container():
             comparison_metrics = {
@@ -2887,8 +2900,8 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
                 st.markdown("### Charts")
             with charts_toggle_col:
                 if st.button("🔍 Detailed View", key="dashboard_detailed_view_strategy", use_container_width=True):
-                    _, detailed_chart_specs = build_strategy_dashboard_chart_specs(comparison_df, strategy_equity_df)
-                    render_detailed_charts_dialog("Strategy Comparison Charts", detailed_chart_specs)
+                    st.session_state["dashboard_chart_focus"] = "strategy"
+                    st.rerun()
             overview_chart_specs, _ = build_strategy_dashboard_chart_specs(comparison_df, strategy_equity_df)
             top_left, top_center, top_right = st.columns(3)
             for cell, (_, fig) in zip((top_left, top_center, top_right), overview_chart_specs):
@@ -2935,6 +2948,10 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
 
     metrics = build_dashboard_metrics(filtered_df)
     summary_df = build_dashboard_summary_table(filtered_df)
+    if chart_focus_mode == "single":
+        _, detailed_chart_specs = build_single_dashboard_chart_specs(summary_df, filtered_df, metrics)
+        render_detailed_charts_panel("Detailed Dashboard Charts", detailed_chart_specs)
+        return
 
     with st.container():
         summary_display_df = summary_df.rename(columns={"Total PL Amt": "Total Profit / Loss"})
@@ -2976,8 +2993,8 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
             st.markdown("### Charts")
         with charts_toggle_col:
             if st.button("🔍 Detailed View", key="dashboard_detailed_view_single", use_container_width=True):
-                _, detailed_chart_specs = build_single_dashboard_chart_specs(summary_df, filtered_df, metrics)
-                render_detailed_charts_dialog("Detailed Dashboard Charts", detailed_chart_specs)
+                st.session_state["dashboard_chart_focus"] = "single"
+                st.rerun()
         overview_chart_specs, _ = build_single_dashboard_chart_specs(summary_df, filtered_df, metrics)
         chart_a, chart_b, chart_c = st.columns(3)
         for cell, (_, fig) in zip((chart_a, chart_b, chart_c), overview_chart_specs):
@@ -3627,6 +3644,7 @@ def main() -> None:
             )
             st.markdown("<div style='height: 1.2rem;'></div>", unsafe_allow_html=True)
             if st.button("See Dashboard", use_container_width=True, key="open-output-dashboard"):
+                st.session_state["dashboard_chart_focus"] = None
                 render_output_dashboard_dialog(output_dir)
     else:
         from_date = st.date_input(
