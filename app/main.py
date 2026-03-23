@@ -2787,29 +2787,19 @@ def apply_dashboard_cost_model(
 
     base_pl = pd.to_numeric(adjusted_df.get("PL Amt"), errors="coerce")
     closed_mask = base_pl.notna()
+    adjusted_df["Gross PL Amount"] = base_pl
     adjusted_df["Estimated Charges"] = 0.0
     adjusted_df.loc[closed_mask, "Estimated Charges"] = charges_per_trade
-    adjusted_df["Monthly Interest Allocation"] = 0.0
-
-    if prop_dashboard_enabled and monthly_interest_total > 0 and closed_mask.any():
-        interest_month = pd.to_datetime(adjusted_df.get("Entry Timestamp"), errors="coerce").dt.to_period("M").astype(str)
-        adjusted_df["Interest Month"] = interest_month
-        valid_interest_mask = closed_mask & adjusted_df["Interest Month"].ne("NaT")
-        if valid_interest_mask.any():
-            monthly_trade_counts = adjusted_df.loc[valid_interest_mask, "Interest Month"].value_counts()
-            adjusted_df.loc[valid_interest_mask, "Monthly Interest Allocation"] = (
-                adjusted_df.loc[valid_interest_mask, "Interest Month"].map(
-                    lambda month_value: monthly_interest_total / float(monthly_trade_counts.get(month_value, 1))
-                ).astype(float)
-            )
-
-    adjusted_df["PL Amt"] = base_pl - adjusted_df["Estimated Charges"] - adjusted_df["Monthly Interest Allocation"]
+    adjusted_df["Net PL Amount"] = base_pl - adjusted_df["Estimated Charges"]
+    adjusted_df["PL Amt"] = adjusted_df["Net PL Amount"]
     adjusted_df["is_win"] = closed_mask & adjusted_df["PL Amt"].gt(0).fillna(False)
     adjusted_df["is_loss"] = closed_mask & adjusted_df["PL Amt"].lt(0).fillna(False)
 
     total_pl_amt = float(pd.to_numeric(adjusted_df.get("PL Amt"), errors="coerce").fillna(0).sum())
+    interest_months = pd.to_datetime(adjusted_df.loc[closed_mask, "Entry Timestamp"], errors="coerce").dt.to_period("M").dropna().astype(str).unique().tolist()
+    total_interest_deducted = monthly_interest_total * len(interest_months) if prop_dashboard_enabled else 0.0
     roi_base = capital * leverage_value
-    roi_pct = (total_pl_amt / roi_base * 100.0) if prop_dashboard_enabled and roi_base > 0 else 0.0
+    roi_pct = ((total_pl_amt - total_interest_deducted) / roi_base * 100.0) if prop_dashboard_enabled and roi_base > 0 else 0.0
 
     return adjusted_df, {
         "estimated_charges_per_trade": charges_per_trade,
@@ -2818,7 +2808,7 @@ def apply_dashboard_cost_model(
         "leverage": leverage_value,
         "interest_rate_pct": interest_rate_value,
         "monthly_interest_total": monthly_interest_total,
-        "total_interest_deducted": float(adjusted_df["Monthly Interest Allocation"].sum()),
+        "total_interest_deducted": float(total_interest_deducted),
         "roi_pct": roi_pct,
     }
 
@@ -2869,7 +2859,8 @@ def style_dashboard_table(table_df: pd.DataFrame) -> pd.io.formats.style.Styler:
         "Price", "Entry Price", "Exit Price", "PL Amt", "Total PL Amt",
         "Total Profit / Loss", "Total Profit/Loss", "Profit / Loss",
         "Avg Profit Per Trade", "Avg Loss Per Trade", "Avg Net Profit Per Trade",
-        "Max Drawdown", "Total PL",
+        "Max Drawdown", "Total PL", "Gross PL Amount", "Estimated Charges", "Charges",
+        "Net PL Amount", "Interest Deducted",
     }
     number_columns = {
         "PL Points", "Total PL Points", "Win Rate %", "Avg PL Points", "Sharpe Ratio",
@@ -2896,10 +2887,15 @@ def style_dashboard_table(table_df: pd.DataFrame) -> pd.io.formats.style.Styler:
                 "PL Amt", "Total PL Amt", "PL Points", "Total PL Points", "Avg PL Points",
                 "Total PL", "Score", "Max Drawdown", "Profit / Loss", "Total Profit / Loss",
                 "Avg Profit Per Trade", "Avg Loss Per Trade", "Avg Net Profit Per Trade",
+                "Gross PL Amount", "Estimated Charges", "Charges", "Net PL Amount", "Interest Deducted",
             }:
                 continue
             value = row[column]
             if pd.isna(value):
+                continue
+            if column in {"Estimated Charges", "Charges", "Interest Deducted"}:
+                if float(value) > 0:
+                    styles[idx] = "color: #b91c1c; font-weight: 700;"
                 continue
             if float(value) > 0:
                 styles[idx] = "color: #15803d; font-weight: 700;"
@@ -2975,7 +2971,13 @@ def build_dashboard_summary_column_config() -> dict[str, Any]:
     }
 
 
-def build_time_analysis_table(filtered_df: pd.DataFrame, granularity: str) -> pd.DataFrame:
+def build_time_analysis_table(
+    filtered_df: pd.DataFrame,
+    granularity: str,
+    *,
+    prop_dashboard_enabled: bool = False,
+    monthly_interest_total: float = 0.0,
+) -> pd.DataFrame:
     if filtered_df.empty:
         return pd.DataFrame(
             columns=[
@@ -3024,6 +3026,28 @@ def build_time_analysis_table(filtered_df: pd.DataFrame, granularity: str) -> pd
             "Avg_Net": "Avg Net Profit Per Trade",
         }
     )
+    if prop_dashboard_enabled and monthly_interest_total > 0:
+        month_period_df = working_df.loc[working_df["is_closed"], ["Period", "Entry Timestamp"]].copy()
+        month_period_df["Interest Month"] = pd.to_datetime(month_period_df["Entry Timestamp"], errors="coerce").dt.to_period("M").astype(str)
+        month_period_df = month_period_df[
+            month_period_df["Period"].notna()
+            & month_period_df["Interest Month"].notna()
+            & month_period_df["Interest Month"].ne("NaT")
+        ].drop_duplicates()
+        if not month_period_df.empty:
+            month_period_counts = month_period_df.groupby("Interest Month")["Period"].nunique()
+            month_period_df["Interest Deducted"] = month_period_df["Interest Month"].map(
+                lambda month_value: monthly_interest_total / float(month_period_counts.get(month_value, 1))
+            )
+            interest_by_period = month_period_df.groupby("Period")["Interest Deducted"].sum()
+            grouped["Interest Deducted"] = grouped["Period"].map(interest_by_period).fillna(0.0)
+            grouped["Total Profit / Loss"] = grouped["Total Profit / Loss"] - grouped["Interest Deducted"]
+            grouped["Avg Net Profit Per Trade"] = grouped.apply(
+                lambda row: (float(row["Total Profit / Loss"]) / float(row["Trades"])) if float(row["Trades"]) else 0.0,
+                axis=1,
+            )
+        else:
+            grouped["Interest Deducted"] = 0.0
     return grouped.sort_values("Period", kind="stable").reset_index(drop=True)
 
 
@@ -3840,7 +3864,12 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
             index=2,
             key="dashboard_time_analysis_granularity",
         )
-        time_analysis_df = build_time_analysis_table(filtered_df, time_granularity)
+        time_analysis_df = build_time_analysis_table(
+            filtered_df,
+            time_granularity,
+            prop_dashboard_enabled=prop_dashboard_enabled,
+            monthly_interest_total=float(cost_metrics["monthly_interest_total"]),
+        )
         st.dataframe(
             style_dashboard_table(time_analysis_df),
             width="stretch",
@@ -3895,10 +3924,13 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
         detail_columns = [
             "Scrip", "Sr.No", "Entry Date", "Entry Time", "Trade",
             "Entry Price", "Exit Date", "Exit Time", "Exit Price",
-            "Qty", "PL Points", "PL Amt", "Candle Analysis",
+            "PL Points", "Qty", "Gross PL Amount", "Estimated Charges",
+            "Net PL Amount", "Candle Analysis",
         ]
         detail_columns = [column for column in detail_columns if column in drilldown_df.columns]
-        detail_display_df = drilldown_df.loc[:, detail_columns].rename(columns={"PL Amt": "Profit / Loss"})
+        detail_display_df = drilldown_df.loc[:, detail_columns].rename(
+            columns={"Estimated Charges": "Charges"}
+        )
         st.dataframe(
             style_dashboard_table(detail_display_df),
             width="stretch",
