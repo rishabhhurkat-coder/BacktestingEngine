@@ -3036,7 +3036,7 @@ def build_time_analysis_table(
             month_period_df["Period"].notna()
             & month_period_df["Interest Month"].notna()
             & month_period_df["Interest Month"].ne("NaT")
-        ].drop_duplicates()
+        ].drop_duplicates(subset=["Period", "Interest Month"])
         if not month_period_df.empty:
             month_period_counts = month_period_df.groupby("Interest Month")["Period"].nunique()
             month_period_df["Interest Deducted"] = month_period_df["Interest Month"].map(
