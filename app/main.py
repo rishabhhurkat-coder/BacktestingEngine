@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 import urllib.request
 from pathlib import Path
 import tempfile
@@ -710,73 +711,78 @@ def render_drive_process_dialog(
     main_dir: Path,
     drive_input_folder_id: str,
 ) -> None:
-    st.caption("Select one or more scrips from Google Drive Raw Files to process into Input Files.")
-    st.multiselect(
-        "Select Drive Scrips to Process",
-        symbol_names,
-        key="drive_selected_symbols",
-        format_func=display_symbol,
-        help="Only the selected scrips will be processed from Google Drive Raw Files.",
-    )
+    try:
+        st.caption("Select one or more scrips from Google Drive Raw Files to process into Input Files.")
+        st.multiselect(
+            "Select Drive Scrips to Process",
+            symbol_names,
+            key="drive_selected_symbols",
+            format_func=display_symbol,
+            help="Only the selected scrips will be processed from Google Drive Raw Files.",
+        )
 
-    feedback_level = st.session_state.get("drive_dialog_feedback_level")
-    feedback_message = str(st.session_state.get("drive_dialog_feedback_message") or "").strip()
-    if feedback_level and feedback_message:
-        feedback_fn = {
-            "success": st.success,
-            "warning": st.warning,
-            "error": st.error,
-        }.get(feedback_level, st.info)
-        feedback_fn(feedback_message)
+        feedback_level = st.session_state.get("drive_dialog_feedback_level")
+        feedback_message = str(st.session_state.get("drive_dialog_feedback_message") or "").strip()
+        if feedback_level and feedback_message:
+            feedback_fn = {
+                "success": st.success,
+                "warning": st.warning,
+                "error": st.error,
+            }.get(feedback_level, st.info)
+            feedback_fn(feedback_message)
 
-    manual_downloads = st.session_state.get("drive_manual_input_downloads") or []
-    if manual_downloads:
-        st.markdown("**Manual Input File Downloads**")
-        st.caption("These processed CSV files could not be created automatically in Google Drive. Download them and add them manually to Drive Input Files.")
-        for item in manual_downloads:
-            file_name = str(item.get("file_name") or "processed_input.csv")
-            file_bytes = item.get("data") or b""
-            mime_type = str(item.get("mime") or "text/csv")
-            st.download_button(
-                f"Download {file_name}",
-                data=file_bytes,
-                file_name=file_name,
-                mime=mime_type,
-                width="stretch",
-                key=f"drive-dialog-download-{file_name}",
-            )
-
-    process_col, cancel_col = st.columns(2, gap="small")
-    with process_col:
-        if st.button("Process Selected Drive Scrips", width="stretch"):
-            _, input_dir, output_dir = ensure_workspace_dirs(main_dir)
-            try:
-                level, message, manual_downloads = process_selected_drive_raw_symbols(
-                    selected_symbols=list(st.session_state.get("drive_selected_symbols", [])),
-                    symbol_files=symbol_files,
-                    input_dir=input_dir,
-                    drive_input_folder_id=drive_input_folder_id,
+        manual_downloads = st.session_state.get("drive_manual_input_downloads") or []
+        if manual_downloads:
+            st.markdown("**Manual Input File Downloads**")
+            st.caption("These processed CSV files could not be created automatically in Google Drive. Download them and add them manually to Drive Input Files.")
+            for item in manual_downloads:
+                file_name = str(item.get("file_name") or "processed_input.csv")
+                file_bytes = item.get("data") or b""
+                mime_type = str(item.get("mime") or "text/csv")
+                st.download_button(
+                    f"Download {file_name}",
+                    data=file_bytes,
+                    file_name=file_name,
+                    mime=mime_type,
+                    width="stretch",
+                    key=f"drive-dialog-download-{file_name}",
                 )
-            except Exception as exc:
-                level, message, manual_downloads = "error", f"Google Drive processing failed: {exc}", []
-            st.session_state.drive_dialog_feedback_level = level
-            st.session_state.drive_dialog_feedback_message = message
-            st.session_state.drive_manual_input_downloads = manual_downloads
-            st.session_state.main_dir_path_input = str(main_dir)
-            st.session_state.data_dir_path_input = str(input_dir)
-            st.session_state.output_dir_path_input = str(output_dir)
-            st.session_state.selected_symbol = None
-            list_google_drive_folder_files.clear()
-            list_symbols.clear()
-            load_data.clear()
-            st.rerun()
-    with cancel_col:
-        if st.button("Cancel", width="stretch"):
-            st.session_state.drive_dialog_feedback_level = None
-            st.session_state.drive_dialog_feedback_message = ""
-            st.session_state.drive_manual_input_downloads = []
-            st.session_state.show_drive_process_dialog = False
-            st.rerun()
+
+        process_col, cancel_col = st.columns(2, gap="small")
+        with process_col:
+            if st.button("Process Selected Drive Scrips", width="stretch"):
+                _, input_dir, output_dir = ensure_workspace_dirs(main_dir)
+                try:
+                    level, message, manual_downloads = process_selected_drive_raw_symbols(
+                        selected_symbols=list(st.session_state.get("drive_selected_symbols", [])),
+                        symbol_files=symbol_files,
+                        input_dir=input_dir,
+                        drive_input_folder_id=drive_input_folder_id,
+                    )
+                except Exception as exc:
+                    level, message, manual_downloads = "error", f"Google Drive processing failed: {exc}", []
+                st.session_state.drive_dialog_feedback_level = level
+                st.session_state.drive_dialog_feedback_message = message
+                st.session_state.drive_manual_input_downloads = manual_downloads
+                st.session_state.main_dir_path_input = str(main_dir)
+                st.session_state.data_dir_path_input = str(input_dir)
+                st.session_state.output_dir_path_input = str(output_dir)
+                st.session_state.selected_symbol_restore = None
+                list_google_drive_folder_files.clear()
+                list_symbols.clear()
+                load_data.clear()
+                st.rerun()
+        with cancel_col:
+            if st.button("Cancel", width="stretch"):
+                st.session_state.drive_dialog_feedback_level = None
+                st.session_state.drive_dialog_feedback_message = ""
+                st.session_state.drive_manual_input_downloads = []
+                st.session_state.show_drive_process_dialog = False
+                st.rerun()
+    except Exception as exc:
+        st.error(f"Drive processing dialog error: {exc}")
+        with st.expander("Show full error details", expanded=True):
+            st.code(traceback.format_exc(), language="python")
 
 
 def build_processing_feedback(summary) -> tuple[str, str]:
@@ -1884,7 +1890,12 @@ def build_output_dashboard_summary(output_dir: Path) -> tuple[dict[str, Any], pd
 
 @st.dialog("Output Dashboard", width="large")
 def render_output_dashboard_dialog(output_dir: Path) -> None:
-    render_interactive_output_dashboard(output_dir)
+    try:
+        render_interactive_output_dashboard(output_dir)
+    except Exception as exc:
+        st.error(f"Dashboard error: {exc}")
+        with st.expander("Show full error details", expanded=True):
+            st.code(traceback.format_exc(), language="python")
 
 
 DASHBOARD_OUTPUT_COLUMNS = [
