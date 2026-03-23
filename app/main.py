@@ -3024,8 +3024,12 @@ def build_single_dashboard_chart_specs(summary_df: pd.DataFrame, filtered_df: pd
             title="Equity Curve",
             color_discrete_sequence=[LIGHT_LINES[0]],
         )
+        equity_curve_fig.update_traces(
+            line=dict(color=LIGHT_LINES[0], width=3),
+            fillcolor="rgba(37,99,235,0.30)",
+        )
         equity_curve_fig.update_xaxes(
-            rangeslider_visible=True,
+            rangeslider_visible=False,
             rangeselector=dict(
                 buttons=[
                     dict(count=1, label="1M", step="month", stepmode="backward"),
