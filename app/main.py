@@ -11,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 from .component import tv_chart_component, build_dir
@@ -1855,28 +1856,647 @@ def build_output_dashboard_summary(output_dir: Path) -> tuple[dict[str, Any], pd
 
 @st.dialog("Output Dashboard", width="large")
 def render_output_dashboard_dialog(output_dir: Path) -> None:
-    st.caption(f"Read-only summary of the current Output Files folder: {output_dir}")
-    metrics, summary_df = build_output_dashboard_summary(output_dir)
-    top_a, top_b, top_c = st.columns(3)
-    top_a.metric("Scrip Files", metrics["scrip_files"])
-    top_b.metric("Trade Rows", metrics["trade_rows"])
-    top_c.metric("Closed Trades", metrics["closed_trades"])
-    mid_a, mid_b, mid_c = st.columns(3)
-    mid_a.metric("Open Trades", metrics["open_trades"])
-    mid_b.metric("Total PL Points", f"{metrics['total_pl_points']:.2f}")
-    mid_c.metric("Total PL Amt", f"{metrics['total_pl_amt']:.2f}")
+    render_interactive_output_dashboard(output_dir)
 
-    if summary_df.empty:
-        st.info("No Output Files data is available yet.")
+
+DASHBOARD_OUTPUT_COLUMNS = [
+    "Scrip",
+    "Sr.No",
+    "Date",
+    "Time",
+    "Trade",
+    "Price",
+    "Entry Date",
+    "Entry Time",
+    "Entry Price",
+    "Exit Date",
+    "Exit Time",
+    "Exit Price",
+    "Qty",
+    "PL Points",
+    "PL Amt",
+    "Candle Analysis",
+]
+
+
+def dashboard_folder_signature(folder: Path) -> tuple[tuple[str, int, int], ...]:
+    if not folder.exists() or not folder.is_dir():
+        return ()
+    signature: list[tuple[str, int, int]] = []
+    for file_path in list_supported_data_files(folder):
+        try:
+            stat = file_path.stat()
+        except OSError:
+            continue
+        signature.append((file_path.name, int(stat.st_mtime_ns), int(stat.st_size)))
+    return tuple(signature)
+
+
+def dashboard_strategy_dirs(output_dir: Path) -> list[Path]:
+    if not output_dir.exists() or not output_dir.is_dir():
+        return []
+    folders: list[Path] = []
+    for child in sorted(output_dir.iterdir(), key=lambda item: item.name.lower()):
+        if child.is_dir() and dashboard_folder_signature(child):
+            folders.append(child)
+    return folders
+
+
+def dashboard_normalize_time_text(value: Any) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        return normalize_time(text).replace(".", ":")
+    except Exception:
+        return text.replace(".", ":")
+
+
+def dashboard_parse_timestamp(date_series: pd.Series, time_series: pd.Series) -> pd.Series:
+    date_text = date_series.fillna("").astype(str).str.strip()
+    time_text = time_series.map(dashboard_normalize_time_text)
+    timestamp = pd.to_datetime(
+        (date_text + " " + time_text).str.strip(),
+        format="%d-%b-%y %H:%M",
+        errors="coerce",
+    )
+    missing_time_mask = time_text.eq("")
+    if missing_time_mask.any():
+        timestamp.loc[missing_time_mask] = pd.to_datetime(
+            date_text.loc[missing_time_mask],
+            format="%d-%b-%y",
+            errors="coerce",
+        )
+    return timestamp
+
+
+def empty_dashboard_trade_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=DASHBOARD_OUTPUT_COLUMNS + [
+        "Strategy",
+        "Source File",
+        "Entry Timestamp",
+        "Exit Timestamp",
+        "is_open",
+        "is_closed",
+        "is_win",
+        "is_loss",
+    ])
+
+
+def normalize_dashboard_trade_df(raw_df: pd.DataFrame, file_path: Path, strategy_name: str | None = None) -> pd.DataFrame:
+    if raw_df.empty:
+        return empty_dashboard_trade_df().iloc[0:0].copy()
+
+    safe_df = raw_df.copy()
+    safe_df.columns = safe_df.columns.astype(str).str.strip()
+    for column in DASHBOARD_OUTPUT_COLUMNS:
+        if column not in safe_df.columns:
+            safe_df[column] = pd.NA
+    safe_df = safe_df.loc[:, DASHBOARD_OUTPUT_COLUMNS].copy()
+    safe_df["Scrip"] = safe_df["Scrip"].fillna(file_path.stem).astype(str).str.strip()
+    safe_df.loc[safe_df["Scrip"].eq(""), "Scrip"] = file_path.stem
+    safe_df["Strategy"] = str(strategy_name or "Current")
+    safe_df["Source File"] = file_path.name
+
+    for numeric_column in ["Sr.No", "Price", "Entry Price", "Exit Price", "Qty", "PL Points", "PL Amt"]:
+        safe_df[numeric_column] = pd.to_numeric(safe_df[numeric_column], errors="coerce")
+
+    safe_df["Entry Timestamp"] = dashboard_parse_timestamp(safe_df["Entry Date"], safe_df["Entry Time"])
+    safe_df["Exit Timestamp"] = dashboard_parse_timestamp(safe_df["Exit Date"], safe_df["Exit Time"])
+    safe_df["is_open"] = safe_df["Exit Price"].isna()
+    safe_df["is_closed"] = ~safe_df["is_open"]
+    safe_df["is_win"] = safe_df["PL Points"].gt(0).fillna(False)
+    safe_df["is_loss"] = safe_df["PL Points"].lt(0).fillna(False)
+    return safe_df
+
+
+@st.cache_data(show_spinner=False)
+def load_dashboard_trade_rows(
+    folder_path: str,
+    file_signature: tuple[tuple[str, int, int], ...],
+    strategy_name: str | None = None,
+) -> pd.DataFrame:
+    folder = Path(folder_path)
+    if not file_signature or not folder.exists():
+        return empty_dashboard_trade_df().copy()
+
+    frames: list[pd.DataFrame] = []
+    for file_name, _, _ in file_signature:
+        file_path = folder / file_name
+        if not file_path.exists():
+            continue
+        try:
+            raw_df = read_tabular_file(file_path)
+        except Exception:
+            continue
+        normalized_df = normalize_dashboard_trade_df(raw_df, file_path, strategy_name=strategy_name)
+        if not normalized_df.empty:
+            frames.append(normalized_df)
+    if not frames:
+        return empty_dashboard_trade_df().copy()
+    return pd.concat(frames, ignore_index=True)
+
+
+def filter_dashboard_trade_rows(
+    trade_df: pd.DataFrame,
+    start_date: Any,
+    end_date: Any,
+    include_open_trades: bool,
+) -> pd.DataFrame:
+    if trade_df.empty:
+        return trade_df.copy()
+
+    filtered_df = trade_df.copy()
+    entry_dates = filtered_df["Entry Timestamp"].dt.date
+    start = pd.Timestamp(start_date).date()
+    end = pd.Timestamp(end_date).date()
+    filtered_df = filtered_df[(entry_dates >= start) & (entry_dates <= end)].copy()
+    if not include_open_trades:
+        filtered_df = filtered_df[filtered_df["is_closed"]].copy()
+    return filtered_df.reset_index(drop=True)
+
+
+def compute_dashboard_sharpe(closed_df: pd.DataFrame) -> float:
+    if closed_df.empty or "PL Amt" not in closed_df.columns:
+        return 0.0
+    returns = pd.to_numeric(closed_df["PL Amt"], errors="coerce").dropna()
+    if returns.empty:
+        return 0.0
+    std_return = float(returns.std())
+    if std_return == 0.0:
+        return 0.0
+    return (float(returns.mean()) / std_return) * (len(returns) ** 0.5)
+
+
+def build_dashboard_equity_curve(closed_df: pd.DataFrame) -> pd.DataFrame:
+    if closed_df.empty:
+        return pd.DataFrame(columns=["Entry Timestamp", "PL Amt", "Equity Curve", "Peak", "Drawdown"])
+    equity_df = closed_df.copy()
+    equity_df = equity_df.sort_values(["Entry Timestamp", "Scrip", "Sr.No"], kind="stable").reset_index(drop=True)
+    equity_df["PL Amt"] = pd.to_numeric(equity_df["PL Amt"], errors="coerce").fillna(0.0)
+    equity_df["Equity Curve"] = equity_df["PL Amt"].cumsum()
+    equity_df["Peak"] = equity_df["Equity Curve"].cummax()
+    equity_df["Drawdown"] = equity_df["Equity Curve"] - equity_df["Peak"]
+    return equity_df
+
+
+def build_dashboard_metrics(filtered_df: pd.DataFrame) -> dict[str, Any]:
+    closed_df = filtered_df[filtered_df["is_closed"]].copy() if not filtered_df.empty else filtered_df.copy()
+    equity_df = build_dashboard_equity_curve(closed_df)
+    closed_trades = int(filtered_df["is_closed"].sum()) if "is_closed" in filtered_df.columns else 0
+    wins = int(filtered_df["is_win"].sum()) if "is_win" in filtered_df.columns else 0
+    return {
+        "total_scrips": int(filtered_df["Scrip"].nunique()) if not filtered_df.empty else 0,
+        "total_trades": int(len(filtered_df)),
+        "closed_trades": closed_trades,
+        "open_trades": int(filtered_df["is_open"].sum()) if "is_open" in filtered_df.columns else 0,
+        "total_pl_points": float(pd.to_numeric(filtered_df.get("PL Points"), errors="coerce").fillna(0).sum()) if not filtered_df.empty else 0.0,
+        "total_pl_amt": float(pd.to_numeric(filtered_df.get("PL Amt"), errors="coerce").fillna(0).sum()) if not filtered_df.empty else 0.0,
+        "win_rate": (wins / closed_trades * 100.0) if closed_trades else 0.0,
+        "sharpe_ratio": compute_dashboard_sharpe(closed_df),
+        "max_drawdown": float(equity_df["Drawdown"].min()) if not equity_df.empty else 0.0,
+        "equity_df": equity_df,
+    }
+
+
+def build_dashboard_summary_table(filtered_df: pd.DataFrame) -> pd.DataFrame:
+    if filtered_df.empty:
+        return pd.DataFrame(columns=[
+            "Scrip",
+            "Trades",
+            "Closed Trades",
+            "Open Trades",
+            "Wins",
+            "Losses",
+            "Total PL Points",
+            "Total PL Amt",
+            "Win Rate %",
+        ])
+    summary_df = (
+        filtered_df.groupby("Scrip", dropna=False)
+        .agg(
+            Trades=("Scrip", "size"),
+            Closed_Trades=("is_closed", "sum"),
+            Open_Trades=("is_open", "sum"),
+            Wins=("is_win", "sum"),
+            Losses=("is_loss", "sum"),
+            Total_PL_Points=("PL Points", "sum"),
+            Total_PL_Amt=("PL Amt", "sum"),
+        )
+        .reset_index()
+    )
+    summary_df["Win Rate %"] = summary_df.apply(
+        lambda row: (float(row["Wins"]) / float(row["Closed_Trades"]) * 100.0) if float(row["Closed_Trades"]) else 0.0,
+        axis=1,
+    )
+    return summary_df.rename(
+        columns={
+            "Closed_Trades": "Closed Trades",
+            "Open_Trades": "Open Trades",
+            "Total_PL_Points": "Total PL Points",
+            "Total_PL_Amt": "Total PL Amt",
+        }
+    ).sort_values(["Total PL Amt", "Scrip"], ascending=[False, True], kind="stable").reset_index(drop=True)
+
+
+def style_dashboard_table(table_df: pd.DataFrame) -> pd.io.formats.style.Styler:
+    safe_df = table_df.copy()
+    number_columns = {
+        "Price", "Entry Price", "Exit Price", "PL Points", "PL Amt",
+        "Total PL Points", "Total PL Amt", "Win Rate %", "Avg PL Points", "Total PL",
+    }
+
+    def fmt_value(column: str, value: Any) -> str:
+        if pd.isna(value):
+            return ""
+        if column in {"Sr.No", "Qty", "Trades", "Closed Trades", "Open Trades", "Wins", "Losses"}:
+            return f"{int(value)}"
+        if column in number_columns:
+            return f"{float(value):.2f}"
+        return str(value)
+
+    formatters = {column: (lambda value, col=column: fmt_value(col, value)) for column in safe_df.columns}
+
+    def row_styles(row: pd.Series) -> list[str]:
+        styles = [""] * len(row)
+        for idx, column in enumerate(row.index):
+            if column not in {"PL Amt", "Total PL Amt", "PL Points", "Total PL Points", "Avg PL Points", "Total PL"}:
+                continue
+            value = row[column]
+            if pd.isna(value):
+                continue
+            if float(value) > 0:
+                styles[idx] = "color: #15803d; font-weight: 700;"
+            elif float(value) < 0:
+                styles[idx] = "color: #b91c1c; font-weight: 700;"
+        return styles
+
+    return (
+        safe_df.style
+        .apply(row_styles, axis=1)
+        .format(formatters)
+        .set_properties(**{"text-align": "center"})
+    )
+
+
+def render_dashboard_metric(cell, label: str, value: Any, delta_value: float | None = None, *, percent: bool = False) -> None:
+    if isinstance(value, int):
+        display_value = f"{value}"
+    elif isinstance(value, float):
+        display_value = f"{value:.2f}%" if percent else f"{value:.2f}"
+    else:
+        display_value = str(value)
+
+    if delta_value is None:
+        cell.metric(label, display_value)
         return
 
-    st.markdown("**Per Scrip Summary**")
-    st.dataframe(
-        summary_df,
-        use_container_width=True,
-        hide_index=True,
-        height=min(CHART_HEIGHT, 420),
+    delta_text = f"{delta_value:+.2f}% " if percent else f"{delta_value:+.2f}"
+    cell.metric(label, display_value, delta=delta_text.strip(), delta_color="normal")
+
+
+def build_strategy_comparison_dashboard(
+    output_dir: Path,
+    start_date: Any,
+    end_date: Any,
+    include_open_trades: bool,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    strategy_rows: list[dict[str, Any]] = []
+    equity_rows: list[pd.DataFrame] = []
+    for strategy_dir in dashboard_strategy_dirs(output_dir):
+        strategy_df = load_dashboard_trade_rows(
+            str(strategy_dir),
+            dashboard_folder_signature(strategy_dir),
+            strategy_name=strategy_dir.name,
+        )
+        filtered_df = filter_dashboard_trade_rows(strategy_df, start_date, end_date, include_open_trades)
+        metrics = build_dashboard_metrics(filtered_df)
+        strategy_rows.append(
+            {
+                "Strategy": strategy_dir.name,
+                "Trades": int(len(filtered_df)),
+                "Win Rate %": float(metrics["win_rate"]),
+                "Total PL Amt": float(metrics["total_pl_amt"]),
+                "Sharpe Ratio": float(metrics["sharpe_ratio"]),
+                "Max Drawdown": float(metrics["max_drawdown"]),
+            }
+        )
+        if not metrics["equity_df"].empty:
+            equity_rows.append(
+                metrics["equity_df"].loc[:, ["Entry Timestamp", "Equity Curve"]]
+                .assign(Strategy=strategy_dir.name)
+            )
+    comparison_df = pd.DataFrame(strategy_rows)
+    if not comparison_df.empty:
+        comparison_df = comparison_df.sort_values(["Total PL Amt", "Strategy"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    equity_df = pd.concat(equity_rows, ignore_index=True) if equity_rows else pd.DataFrame(columns=["Entry Timestamp", "Equity Curve", "Strategy"])
+    return comparison_df, equity_df
+
+
+def render_interactive_output_dashboard(output_dir: Path) -> None:
+    st.caption(f"Interactive dashboard based on the current Output Files folder: {output_dir}")
+    root_signature = dashboard_folder_signature(output_dir)
+    strategy_dirs = dashboard_strategy_dirs(output_dir)
+    strategy_mode_enabled = st.toggle(
+        "Enable Strategy Comparison",
+        value=False,
+        key="dashboard_strategy_mode",
     )
+    if strategy_mode_enabled and not strategy_dirs:
+        st.info("No strategy subfolders were found. Showing the normal single-strategy dashboard.")
+
+    if not root_signature and not strategy_dirs:
+        st.warning("No Output Files found")
+        return
+
+    root_df = load_dashboard_trade_rows(str(output_dir), root_signature, strategy_name="Current")
+    if root_df.empty and not strategy_dirs:
+        st.info("No trade data available")
+        return
+
+    reference_frames: list[pd.DataFrame] = []
+    if not root_df.empty:
+        reference_frames.append(root_df)
+    for strategy_dir in strategy_dirs:
+        strategy_df = load_dashboard_trade_rows(
+            str(strategy_dir),
+            dashboard_folder_signature(strategy_dir),
+            strategy_name=strategy_dir.name,
+        )
+        if not strategy_df.empty:
+            reference_frames.append(strategy_df)
+    if not reference_frames:
+        st.info("No trade data available")
+        return
+
+    reference_df = pd.concat(reference_frames, ignore_index=True)
+    valid_entry_timestamps = reference_df["Entry Timestamp"].dropna()
+    if valid_entry_timestamps.empty:
+        st.info("No valid trade data available")
+        return
+
+    min_entry_date = valid_entry_timestamps.min().date()
+    max_entry_date = valid_entry_timestamps.max().date()
+
+    with st.container():
+        st.markdown("### Filters")
+        filter_col_a, filter_col_b, filter_col_c = st.columns([1.2, 1.2, 1.0])
+        with filter_col_a:
+            filter_from_date = st.date_input(
+                "Entry Date From",
+                value=min_entry_date,
+                min_value=min_entry_date,
+                max_value=max_entry_date,
+                format="DD/MM/YYYY",
+                key="dashboard_filter_from_date",
+            )
+        with filter_col_b:
+            filter_to_date = st.date_input(
+                "Entry Date To",
+                value=max_entry_date,
+                min_value=min_entry_date,
+                max_value=max_entry_date,
+                format="DD/MM/YYYY",
+                key="dashboard_filter_to_date",
+            )
+        with filter_col_c:
+            include_open_trades = st.checkbox(
+                "Include Open Trades",
+                value=True,
+                key="dashboard_include_open_trades",
+            )
+        if filter_from_date > filter_to_date:
+            st.warning("From date cannot be after To date.")
+            return
+
+    st.markdown("---")
+
+    if strategy_mode_enabled and strategy_dirs:
+        comparison_df, strategy_equity_df = build_strategy_comparison_dashboard(
+            output_dir=output_dir,
+            start_date=filter_from_date,
+            end_date=filter_to_date,
+            include_open_trades=include_open_trades,
+        )
+        if comparison_df.empty:
+            st.info("No trade data available")
+            return
+
+        with st.container():
+            st.markdown("### KPI Overview")
+            comparison_metrics = {
+                "total_scrips": int(len(comparison_df)),
+                "total_trades": int(pd.to_numeric(comparison_df["Trades"], errors="coerce").fillna(0).sum()),
+                "closed_trades": 0,
+                "open_trades": 0,
+                "total_pl_points": 0.0,
+                "total_pl_amt": float(pd.to_numeric(comparison_df["Total PL Amt"], errors="coerce").fillna(0).sum()),
+                "win_rate": float(pd.to_numeric(comparison_df["Win Rate %"], errors="coerce").fillna(0).mean()) if not comparison_df.empty else 0.0,
+                "sharpe_ratio": float(pd.to_numeric(comparison_df["Sharpe Ratio"], errors="coerce").fillna(0).mean()) if not comparison_df.empty else 0.0,
+            }
+            metric_cols = st.columns(8)
+            render_dashboard_metric(metric_cols[0], "Strategies", comparison_metrics["total_scrips"])
+            render_dashboard_metric(metric_cols[1], "Total Trades", comparison_metrics["total_trades"])
+            render_dashboard_metric(metric_cols[2], "Closed Trades", comparison_metrics["closed_trades"])
+            render_dashboard_metric(metric_cols[3], "Open Trades", comparison_metrics["open_trades"])
+            render_dashboard_metric(metric_cols[4], "Total PL Points", comparison_metrics["total_pl_points"], comparison_metrics["total_pl_points"])
+            render_dashboard_metric(metric_cols[5], "Total PL Amount", comparison_metrics["total_pl_amt"], comparison_metrics["total_pl_amt"])
+            render_dashboard_metric(metric_cols[6], "Win Rate %", comparison_metrics["win_rate"], comparison_metrics["win_rate"], percent=True)
+            render_dashboard_metric(metric_cols[7], "Sharpe Ratio", comparison_metrics["sharpe_ratio"], comparison_metrics["sharpe_ratio"])
+
+        st.markdown("---")
+
+        with st.container():
+            st.markdown("### Charts")
+            top_left, top_right = st.columns(2)
+            if not strategy_equity_df.empty:
+                equity_fig = px.line(
+                    strategy_equity_df.sort_values(["Entry Timestamp", "Strategy"], kind="stable"),
+                    x="Entry Timestamp",
+                    y="Equity Curve",
+                    color="Strategy",
+                    title="Equity Curve Comparison",
+                )
+                equity_fig.update_layout(height=360, xaxis_title="", yaxis_title="Equity")
+                top_left.plotly_chart(equity_fig, use_container_width=True)
+            else:
+                top_left.info("No closed trades available for equity comparison.")
+
+            total_pl_fig = px.bar(
+                comparison_df,
+                x="Strategy",
+                y="Total PL Amt",
+                color="Total PL Amt",
+                color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
+                title="PL Comparison",
+            )
+            total_pl_fig.update_layout(height=360, xaxis_title="", yaxis_title="Total PL", coloraxis_showscale=False)
+            top_right.plotly_chart(total_pl_fig, use_container_width=True)
+
+            bottom_left, bottom_right = st.columns(2)
+            sharpe_fig = px.bar(
+                comparison_df,
+                x="Strategy",
+                y="Sharpe Ratio",
+                color="Sharpe Ratio",
+                color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
+                title="Sharpe Comparison",
+            )
+            sharpe_fig.update_layout(height=360, xaxis_title="", yaxis_title="Sharpe Ratio", coloraxis_showscale=False)
+            bottom_left.plotly_chart(sharpe_fig, use_container_width=True)
+
+            drawdown_fig = px.bar(
+                comparison_df,
+                x="Strategy",
+                y="Max Drawdown",
+                color="Max Drawdown",
+                color_continuous_scale=["#15803d", "#e5e7eb", "#b91c1c"],
+                title="Max Drawdown Comparison",
+            )
+            drawdown_fig.update_layout(height=360, xaxis_title="", yaxis_title="Max Drawdown", coloraxis_showscale=False)
+            bottom_right.plotly_chart(drawdown_fig, use_container_width=True)
+
+        st.markdown("---")
+
+        with st.container():
+            st.markdown("### Strategy Comparison")
+            st.dataframe(
+                style_dashboard_table(comparison_df),
+                use_container_width=True,
+                hide_index=True,
+                height=min(CHART_HEIGHT, 420),
+            )
+        return
+
+    filtered_df = filter_dashboard_trade_rows(root_df, filter_from_date, filter_to_date, include_open_trades)
+    if filtered_df.empty:
+        st.info("No trade data available")
+        return
+
+    metrics = build_dashboard_metrics(filtered_df)
+    summary_df = build_dashboard_summary_table(filtered_df)
+
+    with st.container():
+        st.markdown("### KPI Overview")
+        metric_cols = st.columns(8)
+        render_dashboard_metric(metric_cols[0], "Total Scrips", metrics["total_scrips"])
+        render_dashboard_metric(metric_cols[1], "Total Trades", metrics["total_trades"])
+        render_dashboard_metric(metric_cols[2], "Closed Trades", metrics["closed_trades"])
+        render_dashboard_metric(metric_cols[3], "Open Trades", metrics["open_trades"])
+        render_dashboard_metric(metric_cols[4], "Total PL Points", metrics["total_pl_points"], metrics["total_pl_points"])
+        render_dashboard_metric(metric_cols[5], "Total PL Amount", metrics["total_pl_amt"], metrics["total_pl_amt"])
+        render_dashboard_metric(metric_cols[6], "Win Rate %", metrics["win_rate"], metrics["win_rate"], percent=True)
+        render_dashboard_metric(metric_cols[7], "Sharpe Ratio", metrics["sharpe_ratio"], metrics["sharpe_ratio"])
+
+    st.markdown("---")
+
+    with st.container():
+        st.markdown("### Charts")
+        chart_a, chart_b, chart_c = st.columns(3)
+        pnl_fig = px.bar(
+            summary_df,
+            x="Scrip",
+            y="Total PL Amt",
+            color="Total PL Amt",
+            color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
+            title="P&L by Scrip",
+        )
+        pnl_fig.update_layout(height=340, xaxis_title="", yaxis_title="PL Amount", coloraxis_showscale=False)
+        chart_a.plotly_chart(pnl_fig, use_container_width=True)
+
+        win_loss_df = pd.DataFrame({
+            "Outcome": ["Wins", "Losses"],
+            "Count": [int(filtered_df["is_win"].sum()), int(filtered_df["is_loss"].sum())],
+        })
+        win_loss_fig = px.pie(
+            win_loss_df,
+            values="Count",
+            names="Outcome",
+            hole=0.55,
+            color="Outcome",
+            color_discrete_map={"Wins": "#15803d", "Losses": "#b91c1c"},
+            title="Win vs Loss",
+        )
+        win_loss_fig.update_layout(height=340)
+        chart_b.plotly_chart(win_loss_fig, use_container_width=True)
+
+        if metrics["equity_df"].empty:
+            chart_c.info("No closed trades available for equity curve.")
+        else:
+            equity_fig = px.line(
+                metrics["equity_df"],
+                x="Entry Timestamp",
+                y="Equity Curve",
+                title="Equity Curve",
+            )
+            equity_fig.update_traces(line_color="#2563eb", line_width=3)
+            equity_fig.update_layout(height=340, xaxis_title="", yaxis_title="Equity")
+            chart_c.plotly_chart(equity_fig, use_container_width=True)
+
+    st.markdown("---")
+
+    with st.container():
+        st.markdown("### Equity Drawdown")
+        drawdown_col, drawdown_chart_col = st.columns([1.0, 4.0])
+        render_dashboard_metric(drawdown_col, "Max Drawdown", metrics["max_drawdown"], metrics["max_drawdown"])
+        if metrics["equity_df"].empty:
+            drawdown_chart_col.info("No closed trades available for drawdown.")
+        else:
+            drawdown_fig = px.line(
+                metrics["equity_df"],
+                x="Entry Timestamp",
+                y="Drawdown",
+                title="Equity Drawdown",
+            )
+            drawdown_fig.update_traces(line_color="#b91c1c", line_width=3)
+            drawdown_fig.update_layout(height=320, xaxis_title="", yaxis_title="Drawdown")
+            drawdown_chart_col.plotly_chart(drawdown_fig, use_container_width=True)
+
+    st.markdown("---")
+
+    with st.container():
+        st.markdown("### Per-Scrip Summary")
+        st.dataframe(
+            style_dashboard_table(summary_df),
+            use_container_width=True,
+            hide_index=True,
+            height=min(CHART_HEIGHT, 420),
+        )
+
+    st.markdown("---")
+
+    with st.container():
+        st.markdown("### Drill-Down")
+        available_scrips = sorted(filtered_df["Scrip"].dropna().astype(str).unique(), key=str.lower)
+        selected_scrip = st.selectbox(
+            "Select Scrip",
+            available_scrips,
+            key="dashboard_selected_scrip",
+            format_func=display_symbol,
+        )
+        scrip_df = filtered_df[filtered_df["Scrip"] == selected_scrip].copy().reset_index(drop=True)
+        scrip_closed_df = scrip_df[scrip_df["is_closed"]].copy()
+        scrip_win_rate = (float(scrip_closed_df["is_win"].sum()) / float(len(scrip_closed_df)) * 100.0) if len(scrip_closed_df) else 0.0
+        avg_pl_points = float(pd.to_numeric(scrip_closed_df.get("PL Points"), errors="coerce").dropna().mean()) if not scrip_closed_df.empty else 0.0
+        total_pl = float(pd.to_numeric(scrip_df.get("PL Amt"), errors="coerce").fillna(0).sum()) if not scrip_df.empty else 0.0
+        drill_metric_a, drill_metric_b, drill_metric_c = st.columns(3)
+        render_dashboard_metric(drill_metric_a, "Win Rate %", scrip_win_rate, scrip_win_rate, percent=True)
+        render_dashboard_metric(drill_metric_b, "Avg PL Points", avg_pl_points, avg_pl_points)
+        render_dashboard_metric(drill_metric_c, "Total PL", total_pl, total_pl)
+        detail_columns = [
+            "Scrip", "Sr.No", "Entry Date", "Entry Time", "Trade",
+            "Entry Price", "Exit Date", "Exit Time", "Exit Price",
+            "Qty", "PL Points", "PL Amt", "Candle Analysis",
+        ]
+        detail_columns = [column for column in detail_columns if column in scrip_df.columns]
+        st.dataframe(
+            style_dashboard_table(scrip_df.loc[:, detail_columns]),
+            use_container_width=True,
+            hide_index=True,
+            height=min(CHART_HEIGHT, 420),
+        )
 
 
 
