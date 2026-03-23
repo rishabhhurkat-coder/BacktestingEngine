@@ -3752,7 +3752,7 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
             heatmap_fig = px.imshow(
                 heatmap_source,
                 aspect="auto",
-                color_continuous_scale=["#fee2e2", "#f8fafc", "#dcfce7"] if pivot_value_metric in {"Total Profit / Loss", "Avg Net Profit Per Trade"} else "Blues",
+                color_continuous_scale=["#7f1d1d", "#f8fafc", "#166534"] if pivot_value_metric in {"Total Profit / Loss", "Avg Net Profit Per Trade"} else ["#dbeafe", "#1d4ed8", "#1e3a8a"],
                 title=f"{pivot_value_metric} by {pivot_granularity} and Scrip",
             )
             style_dashboard_chart(
