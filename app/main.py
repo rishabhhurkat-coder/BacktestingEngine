@@ -2473,6 +2473,228 @@ def render_dashboard_box(
     )
 
 
+LIGHT_POSITIVE = "#86efac"
+LIGHT_NEGATIVE = "#fca5a5"
+LIGHT_NEUTRAL = "#e2e8f0"
+LIGHT_LINES = ["#93c5fd", "#86efac", "#f9a8d4", "#fdba74", "#c4b5fd", "#67e8f9"]
+
+
+def style_dashboard_chart(fig, *, height: int = 360, xaxis_title: str = "", yaxis_title: str = "", hovermode: str | None = "x unified"):
+    fig.update_layout(
+        height=height,
+        xaxis_title=xaxis_title,
+        yaxis_title=yaxis_title,
+        coloraxis_showscale=False,
+        paper_bgcolor="rgba(255,255,255,0)",
+        plot_bgcolor="rgba(248,250,252,0.55)",
+        margin=dict(l=20, r=20, t=48, b=20),
+        font=dict(color="#334155"),
+        title_font=dict(size=16, color="#0f172a"),
+        legend=dict(bgcolor="rgba(255,255,255,0.75)"),
+    )
+    if hovermode is not None:
+        fig.update_layout(hovermode=hovermode)
+    fig.update_xaxes(showgrid=False, zeroline=False)
+    fig.update_yaxes(showgrid=True, gridcolor="rgba(148,163,184,0.18)", zeroline=False)
+    fig.update_traces(marker_line_width=0)
+    for trace in fig.data:
+        trace_type = getattr(trace, "type", "")
+        if trace_type == "bar":
+            trace.opacity = 0.72
+        elif trace_type == "scatter":
+            if hasattr(trace, "line"):
+                trace.line.width = 2
+        elif trace_type == "pie":
+            trace.opacity = 0.9
+    return fig
+
+
+def build_single_dashboard_chart_specs(summary_df: pd.DataFrame, filtered_df: pd.DataFrame, metrics: dict[str, Any]) -> tuple[list[tuple[str, Any]], list[tuple[str, Any]]]:
+    sorted_summary_df = summary_df.sort_values(["Total PL Amt", "Scrip"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    win_loss_df = pd.DataFrame({
+        "Outcome": ["Wins", "Losses"],
+        "Count": [int(filtered_df["is_win"].sum()), int(filtered_df["is_loss"].sum())],
+    })
+
+    pnl_fig = px.bar(
+        sorted_summary_df,
+        x="Scrip",
+        y="Total PL Amt",
+        color="Total PL Amt",
+        color_continuous_scale=[LIGHT_NEGATIVE, "#f8fafc", LIGHT_POSITIVE],
+        title="Profit / Loss by Scrip",
+    )
+    style_dashboard_chart(pnl_fig, height=340, yaxis_title="Profit / Loss", hovermode="x unified")
+
+    win_loss_fig = px.pie(
+        win_loss_df,
+        values="Count",
+        names="Outcome",
+        hole=0.55,
+        color="Outcome",
+        color_discrete_map={"Wins": LIGHT_POSITIVE, "Losses": LIGHT_NEGATIVE},
+        title="Win vs Loss",
+    )
+    style_dashboard_chart(win_loss_fig, height=340, hovermode=None)
+
+    if metrics["equity_df"].empty:
+        equity_fig = None
+        drawdown_fig = None
+        time_series_fig = None
+    else:
+        equity_fig = px.line(
+            metrics["equity_df"],
+            x="Entry Timestamp",
+            y="Equity Curve",
+            title="Equity Curve",
+            color_discrete_sequence=[LIGHT_LINES[0]],
+        )
+        style_dashboard_chart(equity_fig, height=340, yaxis_title="Equity")
+
+        drawdown_fig = px.line(
+            metrics["equity_df"],
+            x="Entry Timestamp",
+            y="Drawdown",
+            title="Equity Drawdown",
+            color_discrete_sequence=[LIGHT_NEGATIVE],
+        )
+        style_dashboard_chart(drawdown_fig, height=420, yaxis_title="Drawdown")
+
+        time_series_fig = px.line(
+            metrics["equity_df"],
+            x="Entry Timestamp",
+            y="Equity Curve",
+            title="Equity Time Series",
+            color_discrete_sequence=[LIGHT_LINES[1]],
+        )
+        time_series_fig.update_xaxes(
+            rangeslider_visible=True,
+            rangeselector=dict(
+                buttons=[
+                    dict(count=1, label="1M", step="month", stepmode="backward"),
+                    dict(count=3, label="3M", step="month", stepmode="backward"),
+                    dict(count=6, label="6M", step="month", stepmode="backward"),
+                    dict(count=1, label="1Y", step="year", stepmode="backward"),
+                    dict(step="all", label="ALL"),
+                ]
+            ),
+        )
+        style_dashboard_chart(time_series_fig, height=420, yaxis_title="Equity")
+
+    overview = [
+        ("Profit / Loss by Scrip", pnl_fig),
+        ("Win vs Loss", win_loss_fig),
+        ("Equity Curve", equity_fig),
+    ]
+    detailed = overview + [
+        ("Equity Drawdown", drawdown_fig),
+        ("Equity Time Series", time_series_fig),
+    ]
+    return overview, detailed
+
+
+def build_strategy_dashboard_chart_specs(comparison_df: pd.DataFrame, strategy_equity_df: pd.DataFrame) -> tuple[list[tuple[str, Any]], list[tuple[str, Any]]]:
+    if strategy_equity_df.empty:
+        equity_fig = None
+    else:
+        equity_fig = px.line(
+            strategy_equity_df.sort_values(["Entry Timestamp", "Strategy"], kind="stable"),
+            x="Entry Timestamp",
+            y="Equity Curve",
+            color="Strategy",
+            title="Equity Curve Comparison",
+            color_discrete_sequence=LIGHT_LINES,
+        )
+        style_dashboard_chart(equity_fig, height=360, yaxis_title="Equity")
+
+    total_pl_fig = px.bar(
+        comparison_df,
+        x="Strategy",
+        y="Total PL Amt",
+        color="Total PL Amt",
+        color_continuous_scale=[LIGHT_NEGATIVE, "#f8fafc", LIGHT_POSITIVE],
+        title="Profit / Loss Comparison",
+    )
+    style_dashboard_chart(total_pl_fig, height=360, yaxis_title="Total Profit / Loss", hovermode="x unified")
+
+    sharpe_fig = px.bar(
+        comparison_df,
+        x="Strategy",
+        y="Sharpe Ratio",
+        color="Sharpe Ratio",
+        color_continuous_scale=[LIGHT_NEGATIVE, "#f8fafc", LIGHT_POSITIVE],
+        title="Sharpe Comparison",
+    )
+    style_dashboard_chart(sharpe_fig, height=360, yaxis_title="Sharpe Ratio", hovermode="x unified")
+
+    drawdown_fig = px.bar(
+        comparison_df,
+        x="Strategy",
+        y="Max Drawdown",
+        color="Max Drawdown",
+        color_continuous_scale=[LIGHT_POSITIVE, "#f8fafc", LIGHT_NEGATIVE],
+        title="Max Drawdown Comparison",
+    )
+    style_dashboard_chart(drawdown_fig, height=360, yaxis_title="Max Drawdown", hovermode="x unified")
+
+    expectancy_fig = px.bar(
+        comparison_df,
+        x="Strategy",
+        y="Avg Net Profit Per Trade",
+        color="Avg Net Profit Per Trade",
+        color_continuous_scale=[LIGHT_NEGATIVE, "#f8fafc", LIGHT_POSITIVE],
+        title="Avg Net Profit Per Trade Comparison",
+    )
+    style_dashboard_chart(expectancy_fig, height=360, yaxis_title="Avg Net Profit / Trade", hovermode="x unified")
+
+    dd_duration_fig = px.bar(
+        comparison_df,
+        x="Strategy",
+        y="Drawdown Duration",
+        color="Drawdown Duration",
+        color_continuous_scale=[LIGHT_POSITIVE, "#f8fafc", LIGHT_NEGATIVE],
+        title="Drawdown Duration Comparison",
+    )
+    style_dashboard_chart(dd_duration_fig, height=360, yaxis_title="Drawdown Duration", hovermode="x unified")
+
+    overview = [
+        ("Equity Curve Comparison", equity_fig),
+        ("Profit / Loss Comparison", total_pl_fig),
+        ("Sharpe Comparison", sharpe_fig),
+    ]
+    detailed = overview + [
+        ("Max Drawdown Comparison", drawdown_fig),
+        ("Avg Net Profit Per Trade Comparison", expectancy_fig),
+        ("Drawdown Duration Comparison", dd_duration_fig),
+    ]
+    return overview, detailed
+
+
+@st.dialog("Detailed Charts", width="large")
+def render_detailed_charts_dialog(title: str, chart_specs: list[tuple[str, Any]]) -> None:
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stDialog"] > div[role="dialog"] {
+            width: 96vw !important;
+            max-width: 96vw !important;
+        }
+        div[data-testid="stDialog"] section[tabindex="0"] {
+            max-height: 90vh !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(f"### {title}")
+    for chart_title, fig in chart_specs:
+        st.markdown(f"#### {chart_title}")
+        if fig is None:
+            st.info("No data available")
+        else:
+            st.plotly_chart(fig, use_container_width=True)
+
+
 def build_strategy_comparison_dashboard(
     output_dir: Path,
     start_date: Any,
@@ -2595,7 +2817,6 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
                 value=True,
                 key="dashboard_include_open_trades",
             )
-        detailed_view = st.session_state.get("dashboard_detailed_view", False)
         if filter_from_date > filter_to_date:
             st.warning("From date cannot be after To date.")
             return
@@ -2665,77 +2886,16 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
             with charts_header_col:
                 st.markdown("### Charts")
             with charts_toggle_col:
-                detailed_view = st.toggle("🔍 Detailed View", value=detailed_view, key="dashboard_detailed_view")
-            top_left, top_right = st.columns(2)
-            if not strategy_equity_df.empty:
-                equity_fig = px.line(
-                    strategy_equity_df.sort_values(["Entry Timestamp", "Strategy"], kind="stable"),
-                    x="Entry Timestamp",
-                    y="Equity Curve",
-                    color="Strategy",
-                    title="Equity Curve Comparison",
-                )
-                equity_fig.update_layout(height=360, xaxis_title="", yaxis_title="Equity")
-                top_left.plotly_chart(equity_fig, use_container_width=True)
-            else:
-                top_left.info("No closed trades available for equity comparison.")
-
-            total_pl_fig = px.bar(
-                comparison_df,
-                x="Strategy",
-                y="Total PL Amt",
-                color="Total PL Amt",
-                color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
-                title="Profit / Loss Comparison",
-            )
-            total_pl_fig.update_layout(height=360, xaxis_title="", yaxis_title="Total Profit / Loss", coloraxis_showscale=False)
-            top_right.plotly_chart(total_pl_fig, use_container_width=True)
-
-            bottom_left, bottom_right = st.columns(2)
-            sharpe_fig = px.bar(
-                comparison_df,
-                x="Strategy",
-                y="Sharpe Ratio",
-                color="Sharpe Ratio",
-                color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
-                title="Sharpe Comparison",
-            )
-            sharpe_fig.update_layout(height=360, xaxis_title="", yaxis_title="Sharpe Ratio", coloraxis_showscale=False)
-            bottom_left.plotly_chart(sharpe_fig, use_container_width=True)
-
-            drawdown_fig = px.bar(
-                comparison_df,
-                x="Strategy",
-                y="Max Drawdown",
-                color="Max Drawdown",
-                color_continuous_scale=["#15803d", "#e5e7eb", "#b91c1c"],
-                title="Max Drawdown Comparison",
-            )
-            drawdown_fig.update_layout(height=360, xaxis_title="", yaxis_title="Max Drawdown", coloraxis_showscale=False)
-            bottom_right.plotly_chart(drawdown_fig, use_container_width=True)
-
-            lower_left, lower_right = st.columns(2)
-            expectancy_fig = px.bar(
-                comparison_df,
-                x="Strategy",
-                y="Avg Net Profit Per Trade",
-                color="Avg Net Profit Per Trade",
-                color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
-                title="Avg Net Profit Per Trade Comparison",
-            )
-            expectancy_fig.update_layout(height=360, xaxis_title="", yaxis_title="Avg Net Profit / Trade", coloraxis_showscale=False)
-            lower_left.plotly_chart(expectancy_fig, use_container_width=True)
-
-            dd_duration_fig = px.bar(
-                comparison_df,
-                x="Strategy",
-                y="Drawdown Duration",
-                color="Drawdown Duration",
-                color_continuous_scale=["#15803d", "#e5e7eb", "#b91c1c"],
-                title="Drawdown Duration Comparison",
-            )
-            dd_duration_fig.update_layout(height=360, xaxis_title="", yaxis_title="Drawdown Duration", coloraxis_showscale=False)
-            lower_right.plotly_chart(dd_duration_fig, use_container_width=True)
+                if st.button("🔍 Detailed View", key="dashboard_detailed_view_strategy", use_container_width=True):
+                    _, detailed_chart_specs = build_strategy_dashboard_chart_specs(comparison_df, strategy_equity_df)
+                    render_detailed_charts_dialog("Strategy Comparison Charts", detailed_chart_specs)
+            overview_chart_specs, _ = build_strategy_dashboard_chart_specs(comparison_df, strategy_equity_df)
+            top_left, top_center, top_right = st.columns(3)
+            for cell, (_, fig) in zip((top_left, top_center, top_right), overview_chart_specs):
+                if fig is None:
+                    cell.info("No data available")
+                else:
+                    cell.plotly_chart(fig, use_container_width=True)
 
         with st.container():
             st.markdown("### Strategy Comparison")
@@ -2815,123 +2975,16 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
         with charts_header_col:
             st.markdown("### Charts")
         with charts_toggle_col:
-            detailed_view = st.toggle("🔍 Detailed View", value=detailed_view, key="dashboard_detailed_view")
-        sorted_summary_df = summary_df.sort_values(["Total PL Amt", "Scrip"], ascending=[False, True], kind="stable").reset_index(drop=True)
-        win_loss_df = pd.DataFrame({
-            "Outcome": ["Wins", "Losses"],
-            "Count": [int(filtered_df["is_win"].sum()), int(filtered_df["is_loss"].sum())],
-        })
-        if not detailed_view:
-            chart_a, chart_b, chart_c = st.columns(3)
-            pnl_fig = px.bar(
-                sorted_summary_df,
-                x="Scrip",
-                y="Total PL Amt",
-                color="Total PL Amt",
-                color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
-                title="Profit / Loss by Scrip",
-            )
-            pnl_fig.update_layout(height=340, xaxis_title="", yaxis_title="Profit / Loss", coloraxis_showscale=False)
-            chart_a.plotly_chart(pnl_fig, use_container_width=True)
-
-            win_loss_fig = px.pie(
-                win_loss_df,
-                values="Count",
-                names="Outcome",
-                hole=0.55,
-                color="Outcome",
-                color_discrete_map={"Wins": "#15803d", "Losses": "#b91c1c"},
-                title="Win vs Loss",
-            )
-            win_loss_fig.update_layout(height=340)
-            chart_b.plotly_chart(win_loss_fig, use_container_width=True)
-
-            if metrics["equity_df"].empty:
-                chart_c.info("No data available")
+            if st.button("🔍 Detailed View", key="dashboard_detailed_view_single", use_container_width=True):
+                _, detailed_chart_specs = build_single_dashboard_chart_specs(summary_df, filtered_df, metrics)
+                render_detailed_charts_dialog("Detailed Dashboard Charts", detailed_chart_specs)
+        overview_chart_specs, _ = build_single_dashboard_chart_specs(summary_df, filtered_df, metrics)
+        chart_a, chart_b, chart_c = st.columns(3)
+        for cell, (_, fig) in zip((chart_a, chart_b, chart_c), overview_chart_specs):
+            if fig is None:
+                cell.info("No data available")
             else:
-                equity_fig = px.line(
-                    metrics["equity_df"],
-                    x="Entry Timestamp",
-                    y="Equity Curve",
-                    title="Equity Curve",
-                )
-                equity_fig.update_traces(line_color="#2563eb", line_width=3)
-                equity_fig.update_layout(height=340, xaxis_title="", yaxis_title="Equity")
-                chart_c.plotly_chart(equity_fig, use_container_width=True)
-        else:
-            pnl_fig = px.bar(
-                sorted_summary_df,
-                x="Scrip",
-                y="Total PL Amt",
-                color="Total PL Amt",
-                color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
-                title="Profit / Loss by Scrip",
-            )
-            pnl_fig.update_layout(height=420, xaxis_title="", yaxis_title="Profit / Loss", coloraxis_showscale=False)
-            st.plotly_chart(pnl_fig, use_container_width=True)
-
-            detail_col_a, detail_col_b = st.columns(2)
-            win_loss_fig = px.pie(
-                win_loss_df,
-                values="Count",
-                names="Outcome",
-                hole=0.58,
-                color="Outcome",
-                color_discrete_map={"Wins": "#15803d", "Losses": "#b91c1c"},
-                title="Win vs Loss",
-            )
-            win_loss_fig.update_layout(height=420)
-            detail_col_a.plotly_chart(win_loss_fig, use_container_width=True)
-
-            if metrics["equity_df"].empty:
-                detail_col_b.info("No data available")
-            else:
-                equity_fig = px.line(
-                    metrics["equity_df"],
-                    x="Entry Timestamp",
-                    y="Equity Curve",
-                    title="Equity Curve",
-                )
-                equity_fig.update_traces(line_color="#2563eb", line_width=3, hovertemplate="%{x}<br>Equity: %{y:,.0f}<extra></extra>")
-                equity_fig.update_layout(height=420, xaxis_title="", yaxis_title="Equity", hovermode="x unified")
-                detail_col_b.plotly_chart(equity_fig, use_container_width=True)
-
-            lower_col_a, lower_col_b = st.columns(2)
-            if metrics["equity_df"].empty:
-                lower_col_a.info("No data available")
-                lower_col_b.info("No data available")
-            else:
-                drawdown_fig = px.line(
-                    metrics["equity_df"],
-                    x="Entry Timestamp",
-                    y="Drawdown",
-                    title="Equity Drawdown",
-                )
-                drawdown_fig.update_traces(line_color="#dc2626", line_width=3, hovertemplate="%{x}<br>Drawdown: %{y:,.0f}<extra></extra>")
-                drawdown_fig.update_layout(height=420, xaxis_title="", yaxis_title="Drawdown", hovermode="x unified")
-                lower_col_a.plotly_chart(drawdown_fig, use_container_width=True)
-
-                time_series_fig = px.line(
-                    metrics["equity_df"],
-                    x="Entry Timestamp",
-                    y="Equity Curve",
-                    title="Time Series",
-                )
-                time_series_fig.update_traces(line_color="#0f766e", line_width=3, hovertemplate="%{x}<br>Equity: %{y:,.0f}<extra></extra>")
-                time_series_fig.update_xaxes(
-                    rangeslider_visible=True,
-                    rangeselector=dict(
-                        buttons=[
-                            dict(count=1, label="1M", step="month", stepmode="backward"),
-                            dict(count=3, label="3M", step="month", stepmode="backward"),
-                            dict(count=6, label="6M", step="month", stepmode="backward"),
-                            dict(count=1, label="1Y", step="year", stepmode="backward"),
-                            dict(step="all", label="ALL"),
-                        ]
-                    ),
-                )
-                time_series_fig.update_layout(height=420, xaxis_title="", yaxis_title="Equity", hovermode="x unified")
-                lower_col_b.plotly_chart(time_series_fig, use_container_width=True)
+                cell.plotly_chart(fig, use_container_width=True)
 
     with st.container():
         st.markdown("### Per-Scrip Summary")
