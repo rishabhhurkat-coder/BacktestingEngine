@@ -2243,6 +2243,39 @@ def render_dashboard_section_header(
             )
 
 
+def render_dashboard_pdf_controls(
+    *,
+    cache_key: str,
+    filename: str,
+    build_pdf_fn,
+    button_label: str = "📄 Prepare Dashboard PDF",
+) -> None:
+    state_key = f"{cache_key}_pdf_bytes"
+    action_col, download_col = st.columns([1.2, 1.8])
+    with action_col:
+        if st.button(button_label, key=f"{cache_key}_prepare_pdf", width="stretch"):
+            try:
+                st.session_state[state_key] = build_pdf_fn()
+            except Exception as exc:
+                st.error(f"PDF generation failed: {exc}")
+                with st.expander("Show full error details", expanded=True):
+                    st.code(traceback.format_exc(), language="python")
+                st.session_state[state_key] = None
+    pdf_bytes = st.session_state.get(state_key)
+    with download_col:
+        if pdf_bytes:
+            st.download_button(
+                "⬇ Download Dashboard PDF",
+                data=pdf_bytes,
+                file_name=filename,
+                mime="application/pdf",
+                width="stretch",
+                key=f"{cache_key}_download_pdf",
+            )
+        else:
+            st.caption("Prepare the PDF when you need it.")
+
+
 def get_dashboard_pdf_fonts() -> tuple[str, str]:
     regular_name = "Helvetica"
     bold_name = "Helvetica-Bold"
@@ -3323,42 +3356,41 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
             best_dd_date = comparison_df.loc[comparison_df["Rank"].eq(1), "DD Date"].iloc[0] if not comparison_df.empty and comparison_df["Rank"].eq(1).any() else "-"
             comparison_download_df = comparison_df.rename(columns={"Total PL Amt": "Total Profit / Loss"})
             _, strategy_chart_specs = build_strategy_dashboard_chart_specs(comparison_df, strategy_equity_df)
-            comparison_pdf = build_dashboard_pdf_report(
-                report_title="Dashboard Summary Report",
-                output_dir=output_dir,
-                filters_text=filters_text,
-                kpi_items=[
-                    ("Strategies", comparison_metrics["total_scrips"]),
-                    ("Total PL", comparison_metrics["total_pl_amt"]),
-                    ("Win Rate %", comparison_metrics["win_rate"]),
-                    ("Risk Reward Ratio", comparison_metrics["risk_reward_ratio"]),
-                    ("Max Drawdown", comparison_metrics["max_drawdown"]),
-                    ("DD Date", best_dd_date),
-                ],
-                advanced_items=[
-                    ("Avg Profit Per Trade", comparison_metrics["avg_profit_per_trade"]),
-                    ("Avg Loss Per Trade", comparison_metrics["avg_loss_per_trade"]),
-                    ("Avg Net Profit Per Trade", comparison_metrics["avg_net_profit_per_trade"]),
-                    ("Total Profit Trades", comparison_metrics["profit_trades"]),
-                    ("Total Loss Trades", comparison_metrics["loss_trades"]),
-                    ("Total Trades", comparison_metrics["total_trades"]),
-                    ("Sharpe Ratio", comparison_metrics["sharpe_ratio"]),
-                ],
-                summary_df=comparison_download_df,
-                detail_df=comparison_df,
-                summary_columns=["Strategy", "Rank", "Trades", "Win Rate %", "Total Profit / Loss", "Risk Reward Ratio", "Max Drawdown", "Score"],
-                detail_columns=["Strategy", "Rank", "Trades", "Total Profit Trades", "Total Loss Trades", "Win Rate %", "Total PL Amt", "Avg Profit Per Trade", "Avg Loss Per Trade", "Avg Net Profit Per Trade", "Sharpe Ratio", "Max Drawdown", "Drawdown Duration", "Risk Reward Ratio", "DD Date", "Score"],
-                detail_title="Strategy Comparison Detail",
-                chart_specs=strategy_chart_specs,
-                detail_group_column="Strategy",
-            )
             render_dashboard_section_header(
                 "KPI Overview",
-                download_data=comparison_pdf,
-                download_filename="dashboard_summary_report.pdf",
-                download_label="📄 Download Dashboard Summary",
-                download_mime="application/pdf",
-                download_key="dashboard-summary-strategy",
+            )
+            render_dashboard_pdf_controls(
+                cache_key=f"dashboard_summary_strategy_{filter_from_date}_{filter_to_date}_{len(comparison_df)}",
+                filename="dashboard_summary_report.pdf",
+                build_pdf_fn=lambda: build_dashboard_pdf_report(
+                    report_title="Dashboard Summary Report",
+                    output_dir=output_dir,
+                    filters_text=filters_text,
+                    kpi_items=[
+                        ("Strategies", comparison_metrics["total_scrips"]),
+                        ("Total PL", comparison_metrics["total_pl_amt"]),
+                        ("Win Rate %", comparison_metrics["win_rate"]),
+                        ("Risk Reward Ratio", comparison_metrics["risk_reward_ratio"]),
+                        ("Max Drawdown", comparison_metrics["max_drawdown"]),
+                        ("DD Date", best_dd_date),
+                    ],
+                    advanced_items=[
+                        ("Avg Profit Per Trade", comparison_metrics["avg_profit_per_trade"]),
+                        ("Avg Loss Per Trade", comparison_metrics["avg_loss_per_trade"]),
+                        ("Avg Net Profit Per Trade", comparison_metrics["avg_net_profit_per_trade"]),
+                        ("Total Profit Trades", comparison_metrics["profit_trades"]),
+                        ("Total Loss Trades", comparison_metrics["loss_trades"]),
+                        ("Total Trades", comparison_metrics["total_trades"]),
+                        ("Sharpe Ratio", comparison_metrics["sharpe_ratio"]),
+                    ],
+                    summary_df=comparison_download_df,
+                    detail_df=comparison_df,
+                    summary_columns=["Strategy", "Rank", "Trades", "Win Rate %", "Total Profit / Loss", "Risk Reward Ratio", "Max Drawdown", "Score"],
+                    detail_columns=["Strategy", "Rank", "Trades", "Total Profit Trades", "Total Loss Trades", "Win Rate %", "Total PL Amt", "Avg Profit Per Trade", "Avg Loss Per Trade", "Avg Net Profit Per Trade", "Sharpe Ratio", "Max Drawdown", "Drawdown Duration", "Risk Reward Ratio", "DD Date", "Score"],
+                    detail_title="Strategy Comparison Detail",
+                    chart_specs=strategy_chart_specs,
+                    detail_group_column="Strategy",
+                ),
             )
             metric_row_1 = st.columns(3)
             render_dashboard_box(metric_row_1[0], "Strategies", comparison_metrics["total_scrips"])
@@ -3437,42 +3469,41 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
         summary_display_df = summary_df.rename(columns={"Total PL Amt": "Total Profit / Loss"})
         detail_display_df = filtered_df.rename(columns={"PL Amt": "Profit / Loss"})
         _, chart_specs = build_single_dashboard_chart_specs(summary_df, filtered_df, metrics)
-        summary_pdf = build_dashboard_pdf_report(
-            report_title="Dashboard Summary Report",
-            output_dir=output_dir,
-            filters_text=filters_text,
-            kpi_items=[
-                ("Total Scrips", metrics["total_scrips"]),
-                ("Total PL", metrics["total_pl_amt"]),
-                ("Win Rate %", metrics["win_rate"]),
-                ("Risk Reward Ratio", metrics["risk_reward_ratio"]),
-                ("Max Drawdown", metrics["max_drawdown"]),
-                ("DD Date", metrics["dd_date"]),
-            ],
-            advanced_items=[
-                ("Avg Profit Per Trade", metrics["avg_profit_per_trade"]),
-                ("Avg Loss Per Trade", metrics["avg_loss_per_trade"]),
-                ("Avg Net Profit Per Trade", metrics["avg_net_profit_per_trade"]),
-                ("Total Profit Trades", metrics["wins"]),
-                ("Total Loss Trades", metrics["losses"]),
-                ("Total Trades", metrics["total_trades"]),
-                ("Sharpe Ratio", metrics["sharpe_ratio"]),
-            ],
-            summary_df=summary_display_df,
-            detail_df=detail_display_df,
-            summary_columns=["Scrip", "Trades", "Closed Trades", "Open Trades", "Wins", "Losses", "Win Rate %", "Total Profit / Loss"],
-            detail_columns=["Scrip", "Sr.No", "Entry Date", "Entry Time", "Trade", "Entry Price", "Exit Date", "Exit Time", "Exit Price", "Qty", "Profit / Loss", "Candle Analysis"],
-            detail_title="Trade Detail",
-            chart_specs=chart_specs,
-            detail_group_column="Scrip",
-        )
         render_dashboard_section_header(
             "KPI Overview",
-            download_data=summary_pdf,
-            download_filename="dashboard_summary_report.pdf",
-            download_label="📄 Download Dashboard Summary",
-            download_mime="application/pdf",
-            download_key="dashboard-summary-single",
+        )
+        render_dashboard_pdf_controls(
+            cache_key=f"dashboard_summary_single_{filter_from_date}_{filter_to_date}_{len(filtered_df)}_{metrics['total_pl_amt']:.2f}",
+            filename="dashboard_summary_report.pdf",
+            build_pdf_fn=lambda: build_dashboard_pdf_report(
+                report_title="Dashboard Summary Report",
+                output_dir=output_dir,
+                filters_text=filters_text,
+                kpi_items=[
+                    ("Total Scrips", metrics["total_scrips"]),
+                    ("Total PL", metrics["total_pl_amt"]),
+                    ("Win Rate %", metrics["win_rate"]),
+                    ("Risk Reward Ratio", metrics["risk_reward_ratio"]),
+                    ("Max Drawdown", metrics["max_drawdown"]),
+                    ("DD Date", metrics["dd_date"]),
+                ],
+                advanced_items=[
+                    ("Avg Profit Per Trade", metrics["avg_profit_per_trade"]),
+                    ("Avg Loss Per Trade", metrics["avg_loss_per_trade"]),
+                    ("Avg Net Profit Per Trade", metrics["avg_net_profit_per_trade"]),
+                    ("Total Profit Trades", metrics["wins"]),
+                    ("Total Loss Trades", metrics["losses"]),
+                    ("Total Trades", metrics["total_trades"]),
+                    ("Sharpe Ratio", metrics["sharpe_ratio"]),
+                ],
+                summary_df=summary_display_df,
+                detail_df=detail_display_df,
+                summary_columns=["Scrip", "Trades", "Closed Trades", "Open Trades", "Wins", "Losses", "Win Rate %", "Total Profit / Loss"],
+                detail_columns=["Scrip", "Sr.No", "Entry Date", "Entry Time", "Trade", "Entry Price", "Exit Date", "Exit Time", "Exit Price", "Qty", "Profit / Loss", "Candle Analysis"],
+                detail_title="Trade Detail",
+                chart_specs=chart_specs,
+                detail_group_column="Scrip",
+            ),
         )
         metric_row_1 = st.columns(3)
         render_dashboard_box(metric_row_1[0], "Total Scrips", metrics["total_scrips"])
