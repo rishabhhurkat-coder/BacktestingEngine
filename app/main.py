@@ -2453,9 +2453,9 @@ def render_dashboard_box(
         display_value = str(value)
 
     color_class = ""
-    if force_red or (numeric_value is not None and numeric_value < 0):
+    if force_red:
         color_class = "card-red"
-    elif force_green or (numeric_value is not None and numeric_value > 0):
+    elif force_green:
         color_class = "card-green"
 
     cell.markdown(
@@ -2566,7 +2566,7 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
 
     with st.container():
         st.markdown("### Filters")
-        filter_col_a, filter_col_b, filter_col_c, filter_col_d = st.columns([1.1, 1.1, 0.9, 0.9])
+        filter_col_a, filter_col_b, filter_col_c = st.columns([1.1, 1.1, 0.9])
         with filter_col_a:
             filter_from_date = st.date_input(
                 "Entry Date From",
@@ -2591,12 +2591,7 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
                 value=True,
                 key="dashboard_include_open_trades",
             )
-        with filter_col_d:
-            detailed_view = st.toggle(
-                "🔍 Detailed View",
-                value=False,
-                key="dashboard_detailed_view",
-            )
+        detailed_view = st.session_state.get("dashboard_detailed_view", False)
         if filter_from_date > filter_to_date:
             st.warning("From date cannot be after To date.")
             return
@@ -2643,7 +2638,8 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
             metric_row_2 = st.columns(3)
             render_dashboard_box(metric_row_2[0], "Risk Reward Ratio", comparison_metrics["risk_reward_ratio"], force_green=comparison_metrics["risk_reward_ratio"] > 0)
             render_dashboard_box(metric_row_2[1], "Max Drawdown", comparison_metrics["max_drawdown"], force_red=True)
-            metric_row_2[2].empty()
+            best_dd_date = comparison_df.loc[comparison_df["Rank"].eq(1), "DD Date"].iloc[0] if not comparison_df.empty and comparison_df["Rank"].eq(1).any() else "-"
+            render_dashboard_box(metric_row_2[2], "DD Date", best_dd_date, force_red=True)
 
         with st.container():
             st.markdown("### Advanced Metrics")
@@ -2653,16 +2649,19 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
             render_dashboard_box(advanced_row_1[2], "Avg Net Profit Per Trade", comparison_metrics["avg_net_profit_per_trade"], force_green=comparison_metrics["avg_net_profit_per_trade"] > 0)
             advanced_row_2 = st.columns(3)
             render_dashboard_box(advanced_row_2[0], "Total Profit Trades", comparison_metrics["profit_trades"])
-            render_dashboard_box(advanced_row_2[1], "Total Loss Trades", comparison_metrics["loss_trades"])
+            render_dashboard_box(advanced_row_2[1], "Total Loss Trades", comparison_metrics["loss_trades"], force_red=True)
             render_dashboard_box(advanced_row_2[2], "Total Trades", comparison_metrics["total_trades"])
             advanced_row_3 = st.columns(3)
             render_dashboard_box(advanced_row_3[0], "Sharpe Ratio", comparison_metrics["sharpe_ratio"], force_green=comparison_metrics["sharpe_ratio"] > 0)
-            render_dashboard_box(advanced_row_3[1], "Max Drawdown", comparison_metrics["max_drawdown"], force_red=True)
-            best_dd_date = comparison_df.loc[comparison_df["Rank"].eq(1), "DD Date"].iloc[0] if not comparison_df.empty and comparison_df["Rank"].eq(1).any() else "-"
-            render_dashboard_box(advanced_row_3[2], "DD Date", best_dd_date, force_red=True)
+            advanced_row_3[1].empty()
+            advanced_row_3[2].empty()
 
         with st.container():
-            st.markdown("### Charts")
+            charts_header_col, charts_toggle_col = st.columns([0.82, 0.18])
+            with charts_header_col:
+                st.markdown("### Charts")
+            with charts_toggle_col:
+                detailed_view = st.toggle("🔍 Detailed View", value=detailed_view, key="dashboard_detailed_view")
             top_left, top_right = st.columns(2)
             if not strategy_equity_df.empty:
                 equity_fig = px.line(
@@ -2790,7 +2789,7 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
         metric_row_2 = st.columns(3)
         render_dashboard_box(metric_row_2[0], "Risk Reward Ratio", metrics["risk_reward_ratio"], force_green=metrics["risk_reward_ratio"] > 0)
         render_dashboard_box(metric_row_2[1], "Max Drawdown", metrics["max_drawdown"], force_red=True)
-        metric_row_2[2].empty()
+        render_dashboard_box(metric_row_2[2], "DD Date", metrics["dd_date"], force_red=True)
 
     with st.container():
         st.markdown("### Advanced Metrics")
@@ -2800,15 +2799,19 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
         render_dashboard_box(advanced_row_1[2], "Avg Net Profit Per Trade", metrics["avg_net_profit_per_trade"], force_green=metrics["avg_net_profit_per_trade"] > 0)
         advanced_row_2 = st.columns(3)
         render_dashboard_box(advanced_row_2[0], "Total Profit Trades", metrics["wins"])
-        render_dashboard_box(advanced_row_2[1], "Total Loss Trades", metrics["losses"])
+        render_dashboard_box(advanced_row_2[1], "Total Loss Trades", metrics["losses"], force_red=True)
         render_dashboard_box(advanced_row_2[2], "Total Trades", metrics["total_trades"])
         advanced_row_3 = st.columns(3)
         render_dashboard_box(advanced_row_3[0], "Sharpe Ratio", metrics["sharpe_ratio"], force_green=metrics["sharpe_ratio"] > 0)
-        render_dashboard_box(advanced_row_3[1], "Max Drawdown", metrics["max_drawdown"], force_red=True)
-        render_dashboard_box(advanced_row_3[2], "DD Date", metrics["dd_date"], force_red=True)
+        advanced_row_3[1].empty()
+        advanced_row_3[2].empty()
 
     with st.container():
-        st.markdown("### Charts")
+        charts_header_col, charts_toggle_col = st.columns([0.82, 0.18])
+        with charts_header_col:
+            st.markdown("### Charts")
+        with charts_toggle_col:
+            detailed_view = st.toggle("🔍 Detailed View", value=detailed_view, key="dashboard_detailed_view")
         sorted_summary_df = summary_df.sort_values(["Total PL Amt", "Scrip"], ascending=[False, True], kind="stable").reset_index(drop=True)
         win_loss_df = pd.DataFrame({
             "Outcome": ["Wins", "Losses"],
