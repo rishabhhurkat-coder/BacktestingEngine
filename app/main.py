@@ -2406,7 +2406,7 @@ def render_dashboard_metric(
     if percent and numeric_value is not None:
         display_value = f"{numeric_value:.2f}%"
     elif label in currency_labels and numeric_value is not None:
-        display_value = format_inr_compact(numeric_value) if compact_currency else format_inr(numeric_value)
+        display_value = format_inr(numeric_value)
     elif isinstance(value, int):
         display_value = f"{value}"
     elif isinstance(value, float):
@@ -2414,26 +2414,35 @@ def render_dashboard_metric(
     else:
         display_value = str(value)
 
-    value_color = accent_color or "#0f172a"
-    if numeric_value is not None and numeric_value < 0:
-        value_color = "#b91c1c"
-    color_class = "card-red" if value_color == "#b91c1c" else ("card-green" if (numeric_value is not None and numeric_value > 0 and label in currency_labels) else "")
-    compact_class = " card-compact" if compact_currency else ""
+    if accent_color == "#b91c1c":
+        cell.markdown(
+            f"""
+            <div style="padding-top:0.15rem;">
+                <div style="font-size:0.875rem;color:#6b7280;margin-bottom:0.2rem;">{html.escape(label)}</div>
+                <div style="font-size:1.9rem;font-weight:700;color:#dc2626;line-height:1.1;">{html.escape(display_value)}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return {"label": label, "value": display_value, "color": "#dc2626"}
 
-    cell.markdown(
-        f"""
-        <div class="card{compact_class}">
-            <div class="card-title">
-                {html.escape(label)}
-            </div>
-            <div class="card-value {color_class}" style="color:{value_color};">
-                {html.escape(display_value)}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    return {"label": label, "value": display_value, "color": value_color}
+    delta_text: str | None = None
+    delta_color = "normal"
+    if delta_value is not None and numeric_value is not None:
+        delta_numeric = float(delta_value)
+        if percent:
+            delta_text = f"{delta_numeric:+.2f}%"
+        elif label in currency_labels:
+            delta_text = format_inr(delta_numeric)
+        else:
+            delta_text = f"{delta_numeric:+.2f}"
+        if label == "Max Drawdown":
+            delta_color = "inverse"
+        elif delta_numeric < 0:
+            delta_color = "inverse"
+    cell.metric(label, display_value, delta=delta_text, delta_color=delta_color)
+    metric_color = "#dc2626" if (numeric_value is not None and numeric_value < 0) else "#0f172a"
+    return {"label": label, "value": display_value, "color": metric_color}
 
 
 def build_strategy_comparison_dashboard(
@@ -2533,7 +2542,7 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
 
     with st.container():
         st.markdown("### Filters")
-        filter_col_a, filter_col_b, filter_col_c = st.columns([1.2, 1.2, 1.0])
+        filter_col_a, filter_col_b, filter_col_c, filter_col_d = st.columns([1.1, 1.1, 0.9, 0.9])
         with filter_col_a:
             filter_from_date = st.date_input(
                 "Entry Date From",
@@ -2558,6 +2567,12 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
                 value=True,
                 key="dashboard_include_open_trades",
             )
+        with filter_col_d:
+            detailed_view = st.toggle(
+                "🔍 Detailed View",
+                value=False,
+                key="dashboard_detailed_view",
+            )
         if filter_from_date > filter_to_date:
             st.warning("From date cannot be after To date.")
             return
@@ -2570,7 +2585,7 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
             include_open_trades=include_open_trades,
         )
         if comparison_df.empty:
-            st.info("No trade data available")
+            st.warning("No data available")
             return
 
         with st.container():
@@ -2727,7 +2742,7 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
 
     filtered_df = filter_dashboard_trade_rows(root_df, filter_from_date, filter_to_date, include_open_trades)
     if filtered_df.empty:
-        st.info("No trade data available")
+        st.warning("No data available")
         return
 
     metrics = build_dashboard_metrics(filtered_df)
@@ -2765,65 +2780,126 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
         render_dashboard_metric(advanced_row_3[0], "Risk Reward Ratio", metrics["risk_reward_ratio"], metrics["risk_reward_ratio"])
         render_dashboard_metric(advanced_row_3[1], "Max Drawdown", metrics["max_drawdown"], metrics["max_drawdown"], compact_currency=True)
         render_dashboard_metric(advanced_row_3[2], "DD Date", metrics["dd_date"], accent_color="#b91c1c")
+
     with st.container():
         st.markdown("### Charts")
-        chart_a, chart_b, chart_c = st.columns(3)
-        pnl_fig = px.bar(
-            summary_df,
-            x="Scrip",
-            y="Total PL Amt",
-            color="Total PL Amt",
-            color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
-            title="Profit / Loss by Scrip",
-        )
-        pnl_fig.update_layout(height=340, xaxis_title="", yaxis_title="Profit / Loss", coloraxis_showscale=False)
-        chart_a.plotly_chart(pnl_fig, use_container_width=True)
-
+        sorted_summary_df = summary_df.sort_values(["Total PL Amt", "Scrip"], ascending=[False, True], kind="stable").reset_index(drop=True)
         win_loss_df = pd.DataFrame({
             "Outcome": ["Wins", "Losses"],
             "Count": [int(filtered_df["is_win"].sum()), int(filtered_df["is_loss"].sum())],
         })
-        win_loss_fig = px.pie(
-            win_loss_df,
-            values="Count",
-            names="Outcome",
-            hole=0.55,
-            color="Outcome",
-            color_discrete_map={"Wins": "#15803d", "Losses": "#b91c1c"},
-            title="Win vs Loss",
-        )
-        win_loss_fig.update_layout(height=340)
-        chart_b.plotly_chart(win_loss_fig, use_container_width=True)
+        if not detailed_view:
+            chart_a, chart_b, chart_c = st.columns(3)
+            pnl_fig = px.bar(
+                sorted_summary_df,
+                x="Scrip",
+                y="Total PL Amt",
+                color="Total PL Amt",
+                color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
+                title="Profit / Loss by Scrip",
+            )
+            pnl_fig.update_layout(height=340, xaxis_title="", yaxis_title="Profit / Loss", coloraxis_showscale=False)
+            chart_a.plotly_chart(pnl_fig, use_container_width=True)
 
-        if metrics["equity_df"].empty:
-            chart_c.info("No closed trades available for equity curve.")
-        else:
-            equity_fig = px.line(
-                metrics["equity_df"],
-                x="Entry Timestamp",
-                y="Equity Curve",
-                title="Equity Curve",
+            win_loss_fig = px.pie(
+                win_loss_df,
+                values="Count",
+                names="Outcome",
+                hole=0.55,
+                color="Outcome",
+                color_discrete_map={"Wins": "#15803d", "Losses": "#b91c1c"},
+                title="Win vs Loss",
             )
-            equity_fig.update_traces(line_color="#2563eb", line_width=3)
-            equity_fig.update_layout(height=340, xaxis_title="", yaxis_title="Equity")
-            chart_c.plotly_chart(equity_fig, use_container_width=True)
-    with st.container():
-        st.markdown("### Equity Drawdown")
-        drawdown_col, dd_date_col, drawdown_chart_col = st.columns([1.0, 1.0, 4.0])
-        render_dashboard_metric(drawdown_col, "Max Drawdown", metrics["max_drawdown"], metrics["max_drawdown"], compact_currency=True)
-        render_dashboard_metric(dd_date_col, "DD Date", metrics["dd_date"], accent_color="#b91c1c")
-        if metrics["equity_df"].empty:
-            drawdown_chart_col.info("No closed trades available for drawdown.")
+            win_loss_fig.update_layout(height=340)
+            chart_b.plotly_chart(win_loss_fig, use_container_width=True)
+
+            if metrics["equity_df"].empty:
+                chart_c.info("No data available")
+            else:
+                equity_fig = px.line(
+                    metrics["equity_df"],
+                    x="Entry Timestamp",
+                    y="Equity Curve",
+                    title="Equity Curve",
+                )
+                equity_fig.update_traces(line_color="#2563eb", line_width=3)
+                equity_fig.update_layout(height=340, xaxis_title="", yaxis_title="Equity")
+                chart_c.plotly_chart(equity_fig, use_container_width=True)
         else:
-            drawdown_fig = px.line(
-                metrics["equity_df"],
-                x="Entry Timestamp",
-                y="Drawdown",
-                title="Equity Drawdown",
+            pnl_fig = px.bar(
+                sorted_summary_df,
+                x="Scrip",
+                y="Total PL Amt",
+                color="Total PL Amt",
+                color_continuous_scale=["#b91c1c", "#e5e7eb", "#15803d"],
+                title="Profit / Loss by Scrip",
             )
-            drawdown_fig.update_traces(line_color="#b91c1c", line_width=3)
-            drawdown_fig.update_layout(height=320, xaxis_title="", yaxis_title="Drawdown")
-            drawdown_chart_col.plotly_chart(drawdown_fig, use_container_width=True)
+            pnl_fig.update_layout(height=420, xaxis_title="", yaxis_title="Profit / Loss", coloraxis_showscale=False)
+            st.plotly_chart(pnl_fig, use_container_width=True)
+
+            detail_col_a, detail_col_b = st.columns(2)
+            win_loss_fig = px.pie(
+                win_loss_df,
+                values="Count",
+                names="Outcome",
+                hole=0.58,
+                color="Outcome",
+                color_discrete_map={"Wins": "#15803d", "Losses": "#b91c1c"},
+                title="Win vs Loss",
+            )
+            win_loss_fig.update_layout(height=420)
+            detail_col_a.plotly_chart(win_loss_fig, use_container_width=True)
+
+            if metrics["equity_df"].empty:
+                detail_col_b.info("No data available")
+            else:
+                equity_fig = px.line(
+                    metrics["equity_df"],
+                    x="Entry Timestamp",
+                    y="Equity Curve",
+                    title="Equity Curve",
+                )
+                equity_fig.update_traces(line_color="#2563eb", line_width=3, hovertemplate="%{x}<br>Equity: %{y:,.0f}<extra></extra>")
+                equity_fig.update_layout(height=420, xaxis_title="", yaxis_title="Equity", hovermode="x unified")
+                detail_col_b.plotly_chart(equity_fig, use_container_width=True)
+
+            lower_col_a, lower_col_b = st.columns(2)
+            if metrics["equity_df"].empty:
+                lower_col_a.info("No data available")
+                lower_col_b.info("No data available")
+            else:
+                drawdown_fig = px.line(
+                    metrics["equity_df"],
+                    x="Entry Timestamp",
+                    y="Drawdown",
+                    title="Equity Drawdown",
+                )
+                drawdown_fig.update_traces(line_color="#dc2626", line_width=3, hovertemplate="%{x}<br>Drawdown: %{y:,.0f}<extra></extra>")
+                drawdown_fig.update_layout(height=420, xaxis_title="", yaxis_title="Drawdown", hovermode="x unified")
+                lower_col_a.plotly_chart(drawdown_fig, use_container_width=True)
+
+                time_series_fig = px.line(
+                    metrics["equity_df"],
+                    x="Entry Timestamp",
+                    y="Equity Curve",
+                    title="Time Series",
+                )
+                time_series_fig.update_traces(line_color="#0f766e", line_width=3, hovertemplate="%{x}<br>Equity: %{y:,.0f}<extra></extra>")
+                time_series_fig.update_xaxes(
+                    rangeslider_visible=True,
+                    rangeselector=dict(
+                        buttons=[
+                            dict(count=1, label="1M", step="month", stepmode="backward"),
+                            dict(count=3, label="3M", step="month", stepmode="backward"),
+                            dict(count=6, label="6M", step="month", stepmode="backward"),
+                            dict(count=1, label="1Y", step="year", stepmode="backward"),
+                            dict(step="all", label="ALL"),
+                        ]
+                    ),
+                )
+                time_series_fig.update_layout(height=420, xaxis_title="", yaxis_title="Equity", hovermode="x unified")
+                lower_col_b.plotly_chart(time_series_fig, use_container_width=True)
+
     with st.container():
         st.markdown("### Per-Scrip Summary")
         st.dataframe(
@@ -2835,20 +2911,29 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
 
     with st.container():
         st.markdown("### Drill-Down")
-        available_scrips = sorted(filtered_df["Scrip"].dropna().astype(str).unique(), key=str.lower)
-        selected_scrip = st.selectbox(
+        scrip_list = sorted(filtered_df["Scrip"].dropna().astype(str).unique().tolist(), key=str.lower)
+        scrip_options = ["ALL"] + scrip_list
+        selected_scrips = st.multiselect(
             "Select Scrip",
-            available_scrips,
-            key="dashboard_selected_scrip",
-            format_func=display_symbol,
+            options=scrip_options,
+            default=["ALL"],
+            key="dashboard_selected_scrips",
+            format_func=lambda value: "ALL" if value == "ALL" else display_symbol(value),
         )
-        scrip_df = filtered_df[filtered_df["Scrip"] == selected_scrip].copy().reset_index(drop=True)
-        scrip_closed_df = scrip_df[scrip_df["is_closed"]].copy()
-        scrip_win_rate = (float(scrip_closed_df["is_win"].sum()) / float(len(scrip_closed_df)) * 100.0) if len(scrip_closed_df) else 0.0
-        avg_profit_per_trade = float(pd.to_numeric(scrip_closed_df.get("PL Amt"), errors="coerce").where(pd.to_numeric(scrip_closed_df.get("PL Amt"), errors="coerce") > 0).dropna().mean()) if not scrip_closed_df.empty else 0.0
-        total_pl = float(pd.to_numeric(scrip_df.get("PL Amt"), errors="coerce").fillna(0).sum()) if not scrip_df.empty else 0.0
+        if not selected_scrips or "ALL" in selected_scrips:
+            drilldown_df = filtered_df.copy()
+        else:
+            drilldown_df = filtered_df[filtered_df["Scrip"].isin(selected_scrips)].copy()
+        if drilldown_df.empty:
+            st.warning("No data available")
+            return
+        drilldown_closed_df = drilldown_df[drilldown_df["is_closed"]].copy()
+        drilldown_win_rate = (float(drilldown_closed_df["is_win"].sum()) / float(len(drilldown_closed_df)) * 100.0) if len(drilldown_closed_df) else 0.0
+        drilldown_returns = pd.to_numeric(drilldown_closed_df.get("PL Amt"), errors="coerce")
+        avg_profit_per_trade = float(drilldown_returns.where(drilldown_returns > 0).dropna().mean()) if not drilldown_closed_df.empty else 0.0
+        total_pl = float(pd.to_numeric(drilldown_df.get("PL Amt"), errors="coerce").fillna(0).sum()) if not drilldown_df.empty else 0.0
         drill_metric_a, drill_metric_b, drill_metric_c = st.columns(3)
-        render_dashboard_metric(drill_metric_a, "Win Rate %", scrip_win_rate, scrip_win_rate, percent=True)
+        render_dashboard_metric(drill_metric_a, "Win Rate %", drilldown_win_rate, drilldown_win_rate, percent=True)
         render_dashboard_metric(drill_metric_b, "Avg Profit Per Trade", avg_profit_per_trade, avg_profit_per_trade)
         render_dashboard_metric(drill_metric_c, "Total PL", total_pl, total_pl)
         detail_columns = [
@@ -2856,8 +2941,8 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
             "Entry Price", "Exit Date", "Exit Time", "Exit Price",
             "Qty", "PL Points", "PL Amt", "Candle Analysis",
         ]
-        detail_columns = [column for column in detail_columns if column in scrip_df.columns]
-        detail_display_df = scrip_df.loc[:, detail_columns].rename(columns={"PL Amt": "Profit / Loss"})
+        detail_columns = [column for column in detail_columns if column in drilldown_df.columns]
+        detail_display_df = drilldown_df.loc[:, detail_columns].rename(columns={"PL Amt": "Profit / Loss"})
         st.dataframe(
             style_dashboard_table(detail_display_df),
             use_container_width=True,
