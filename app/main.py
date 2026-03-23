@@ -1762,6 +1762,123 @@ def _table_height_for_rows(row_count: int, min_height: int = 180) -> int:
     return min(CHART_HEIGHT, height)
 
 
+def _load_output_dashboard_rows(output_dir: Path) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    for file_path in list_supported_data_files(output_dir):
+        try:
+            df = read_tabular_file(file_path)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        safe_df = df.copy()
+        safe_df.columns = safe_df.columns.astype(str).str.strip()
+        if "Scrip" not in safe_df.columns:
+            safe_df["Scrip"] = file_path.stem
+        safe_df["Scrip"] = safe_df["Scrip"].fillna(file_path.stem).astype(str).str.strip()
+        for column in ["Qty", "Price", "Entry Price", "Exit Price", "PL Points", "PL Amt"]:
+            if column in safe_df.columns:
+                safe_df[column] = pd.to_numeric(safe_df[column], errors="coerce")
+        frames.append(safe_df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def build_output_dashboard_summary(output_dir: Path) -> tuple[dict[str, Any], pd.DataFrame]:
+    output_df = _load_output_dashboard_rows(output_dir)
+    if output_df.empty:
+        return {
+            "scrip_files": 0,
+            "trade_rows": 0,
+            "closed_trades": 0,
+            "open_trades": 0,
+            "total_pl_points": 0.0,
+            "total_pl_amt": 0.0,
+        }, pd.DataFrame(
+            columns=[
+                "Scrip",
+                "Trades",
+                "Closed Trades",
+                "Open Trades",
+                "Wins",
+                "Losses",
+                "Total PL Points",
+                "Total PL Amt",
+                "Win Rate %",
+            ]
+        )
+
+    working_df = output_df.copy()
+    closed_mask = working_df.get("PL Amt", pd.Series(dtype=float)).notna()
+    working_df["Is Closed"] = closed_mask
+    working_df["Is Open"] = ~closed_mask
+    working_df["Is Win"] = closed_mask & (working_df.get("PL Amt", 0).fillna(0) > 0)
+    working_df["Is Loss"] = closed_mask & (working_df.get("PL Amt", 0).fillna(0) < 0)
+
+    summary_df = (
+        working_df.groupby("Scrip", dropna=False)
+        .agg(
+            Trades=("Scrip", "size"),
+            Closed_Trades=("Is Closed", "sum"),
+            Open_Trades=("Is Open", "sum"),
+            Wins=("Is Win", "sum"),
+            Losses=("Is Loss", "sum"),
+            Total_PL_Points=("PL Points", "sum"),
+            Total_PL_Amt=("PL Amt", "sum"),
+        )
+        .reset_index()
+    )
+    summary_df["Win Rate %"] = summary_df.apply(
+        lambda row: (float(row["Wins"]) / float(row["Closed_Trades"]) * 100.0) if float(row["Closed_Trades"]) else 0.0,
+        axis=1,
+    )
+    summary_df = summary_df.rename(
+        columns={
+            "Closed_Trades": "Closed Trades",
+            "Open_Trades": "Open Trades",
+            "Total_PL_Points": "Total PL Points",
+            "Total_PL_Amt": "Total PL Amt",
+        }
+    ).sort_values(["Total PL Amt", "Scrip"], ascending=[False, True], kind="stable").reset_index(drop=True)
+
+    metrics = {
+        "scrip_files": int(summary_df["Scrip"].nunique()),
+        "trade_rows": int(len(working_df)),
+        "closed_trades": int(working_df["Is Closed"].sum()),
+        "open_trades": int(working_df["Is Open"].sum()),
+        "total_pl_points": float(pd.to_numeric(working_df.get("PL Points"), errors="coerce").fillna(0).sum()),
+        "total_pl_amt": float(pd.to_numeric(working_df.get("PL Amt"), errors="coerce").fillna(0).sum()),
+    }
+    return metrics, summary_df
+
+
+@st.dialog("Output Dashboard", width="large")
+def render_output_dashboard_dialog(output_dir: Path) -> None:
+    st.caption(f"Read-only summary of the current Output Files folder: {output_dir}")
+    metrics, summary_df = build_output_dashboard_summary(output_dir)
+    top_a, top_b, top_c = st.columns(3)
+    top_a.metric("Scrip Files", metrics["scrip_files"])
+    top_b.metric("Trade Rows", metrics["trade_rows"])
+    top_c.metric("Closed Trades", metrics["closed_trades"])
+    mid_a, mid_b, mid_c = st.columns(3)
+    mid_a.metric("Open Trades", metrics["open_trades"])
+    mid_b.metric("Total PL Points", f"{metrics['total_pl_points']:.2f}")
+    mid_c.metric("Total PL Amt", f"{metrics['total_pl_amt']:.2f}")
+
+    if summary_df.empty:
+        st.info("No Output Files data is available yet.")
+        return
+
+    st.markdown("**Per Scrip Summary**")
+    st.dataframe(
+        summary_df,
+        use_container_width=True,
+        hide_index=True,
+        height=min(CHART_HEIGHT, 420),
+    )
+
+
 
 
 def _ensure_unique_columns(table_df: pd.DataFrame) -> pd.DataFrame:
@@ -2350,6 +2467,9 @@ def main() -> None:
                 format="DD/MM/YYYY",
                 key="filter_to_date",
             )
+            st.markdown("<div style='height: 1.2rem;'></div>", unsafe_allow_html=True)
+            if st.button("See Dashboard", use_container_width=True, key="open-output-dashboard"):
+                render_output_dashboard_dialog(output_dir)
     else:
         from_date = st.date_input(
             "From Date",
