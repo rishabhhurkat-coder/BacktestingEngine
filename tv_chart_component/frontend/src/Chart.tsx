@@ -9,6 +9,7 @@ import {
   TickMarkType,
   Time,
   UTCTimestamp,
+  WhitespaceData,
   createChart,
 } from "lightweight-charts";
 import { Streamlit } from "streamlit-component-lib";
@@ -21,9 +22,18 @@ export type Candle = {
   close: number;
 };
 
-export type EmaPoint = {
+export type IndicatorPoint = {
   time: string | number;
-  value: number;
+  value?: number | null;
+};
+
+export type IndicatorSeries = {
+  id: string;
+  name: string;
+  column?: string;
+  color?: string;
+  lineWidth?: number;
+  data: IndicatorPoint[];
 };
 
 export type Marker = {
@@ -34,21 +44,15 @@ export type Marker = {
   text?: string;
 };
 
-type ReplayState = {
-  active?: boolean;
-  index?: number | null;
-  showStartLine?: boolean;
-};
-
 type ChartProps = {
   candles: Candle[];
-  ema: EmaPoint[];
+  indicators?: IndicatorSeries[];
   markers?: Marker[];
+  chartType?: "Candlestick" | "Line Chart";
   height?: number;
-  replayState?: ReplayState | null;
 };
 
-type ModalMode = "goto" | "replay" | "leaveReplay" | null;
+type ModalMode = "goto" | null;
 
 const IST_TIMEZONE = "Asia/Kolkata";
 
@@ -144,11 +148,11 @@ const sessionStartTimestamp = (dateValue: string): UTCTimestamp | null => {
   if (!dateValue) {
     return null;
   }
-  const [year, month, day] = dateValue.split("-").map(Number);
-  if ([year, month, day].some((value) => Number.isNaN(value))) {
+  const parsed = Date.parse(`${dateValue}T00:00:00+05:30`);
+  if (Number.isNaN(parsed)) {
     return null;
   }
-  return Math.floor(Date.UTC(year, month - 1, day, 3, 45, 0) / 1000) as UTCTimestamp;
+  return Math.floor(parsed / 1000) as UTCTimestamp;
 };
 
 const inferInterval = (candleData: CandlestickData<UTCTimestamp>[]): number => {
@@ -197,19 +201,26 @@ const normalizeCandles = (candles: Candle[]): CandlestickData<UTCTimestamp>[] =>
     })
     .filter((item): item is CandlestickData<UTCTimestamp> => item !== null);
 
-const normalizeEma = (ema: EmaPoint[]): LineData<UTCTimestamp>[] =>
-  ema
+const normalizeLineSeries = (
+  points: IndicatorPoint[]
+): Array<LineData<UTCTimestamp> | WhitespaceData<UTCTimestamp>> =>
+  points
     .map((item) => {
       const ts = toTimestamp(item.time);
       if (ts === null) {
         return null;
       }
+      if (item.value === null || item.value === undefined || Number.isNaN(Number(item.value))) {
+        return {
+          time: ts,
+        };
+      }
       return {
         time: ts,
-        value: item.value,
+        value: Number(item.value),
       };
     })
-    .filter((item): item is LineData<UTCTimestamp> => item !== null);
+    .filter((item): item is LineData<UTCTimestamp> | WhitespaceData<UTCTimestamp> => item !== null);
 
 const normalizeMarkers = (markers: Marker[]): SeriesMarker<UTCTimestamp>[] =>
   markers
@@ -231,54 +242,115 @@ const normalizeMarkers = (markers: Marker[]): SeriesMarker<UTCTimestamp>[] =>
     })
     .filter((item): item is SeriesMarker<UTCTimestamp> => item !== null);
 
-const normalizeReplayState = (value: ReplayState | null | undefined): ReplayState => {
-  const active = Boolean(value?.active);
-  const rawIndex = value?.index;
-  const index =
-    rawIndex === null || rawIndex === undefined || Number.isNaN(Number(rawIndex))
-      ? null
-      : Math.max(0, Math.trunc(Number(rawIndex)));
-  const showStartLine = active && Boolean(value?.showStartLine);
-  return {
-    active,
-    index: active ? index : null,
-    showStartLine,
-  };
+const hasLineValue = (
+  point: LineData<UTCTimestamp> | WhitespaceData<UTCTimestamp>
+): point is LineData<UTCTimestamp> => "value" in point && typeof point.value === "number";
+
+const hexToRgba = (color: string, alpha: number): string => {
+  const value = String(color || "").trim();
+  const normalized = value.startsWith("#") ? value.slice(1) : value;
+  if (/^[0-9a-f]{6}$/i.test(normalized)) {
+    const r = Number.parseInt(normalized.slice(0, 2), 16);
+    const g = Number.parseInt(normalized.slice(2, 4), 16);
+    const b = Number.parseInt(normalized.slice(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+  if (/^[0-9a-f]{3}$/i.test(normalized)) {
+    const r = Number.parseInt(normalized[0] + normalized[0], 16);
+    const g = Number.parseInt(normalized[1] + normalized[1], 16);
+    const b = Number.parseInt(normalized[2] + normalized[2], 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+  return value || `rgba(41, 98, 255, ${alpha})`;
 };
+
+const formatOhlcValue = (value: number): string => value.toFixed(2);
+
+const buildCloseLineData = (
+  candleData: CandlestickData<UTCTimestamp>[]
+): LineData<UTCTimestamp>[] =>
+  candleData.map((item) => ({
+    time: item.time,
+    value: item.close,
+  }));
 
 const Chart = ({
   candles,
-  ema,
+  indicators = [],
   markers = [],
+  chartType = "Candlestick",
   height = 600,
-  replayState,
 }: ChartProps): React.ReactElement => {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const overlayCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const emaSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const closeSeriesRef = useRef<ISeriesApi<"Line"> | null>(null);
+  const indicatorSeriesRefs = useRef<Map<string, ISeriesApi<"Line">>>(new Map());
   const lastCandleTsRef = useRef<UTCTimestamp | null>(null);
   const fullCandleDataRef = useRef<CandlestickData<UTCTimestamp>[]>([]);
-  const fullEmaDataRef = useRef<LineData<UTCTimestamp>[]>([]);
+  const fullCloseLineDataRef = useRef<LineData<UTCTimestamp>[]>([]);
+  const fullIndicatorDataRef = useRef<
+    Array<{
+      id: string;
+      name: string;
+      column?: string;
+      color: string;
+      lineWidth: number;
+      data: Array<LineData<UTCTimestamp> | WhitespaceData<UTCTimestamp>>;
+    }>
+  >([]);
   const fullMarkerDataRef = useRef<SeriesMarker<UTCTimestamp>[]>([]);
+  const candleIndexByTimeRef = useRef<Map<number, number>>(new Map());
   const intervalRef = useRef<number>(180);
-  const replayIndexRef = useRef<number | null>(null);
-  const replayActiveRef = useRef(false);
-  const showReplayStartLineRef = useRef(false);
   const sessionBreakTimesRef = useRef<UTCTimestamp[]>([]);
   const resetViewRef = useRef<(() => void) | null>(null);
   const hasFitRef = useRef(false);
   const isReadyRef = useRef(false);
   const zoomedStateRef = useRef(false);
+  const chartTypeRef = useRef<"Candlestick" | "Line Chart">("Candlestick");
   const pendingClickTimerRef = useRef<number | null>(null);
   const pendingClickEpochRef = useRef<UTCTimestamp | null>(null);
 
   const [modalMode, setModalMode] = useState<ModalMode>(null);
   const [dateValue, setDateValue] = useState("");
   const [sessionBreakXs, setSessionBreakXs] = useState<number[]>([]);
-  const [replayCursorX, setReplayCursorX] = useState<number | null>(null);
-  const [replayActive, setReplayActive] = useState(false);
-  const [showReplayStartLine, setShowReplayStartLine] = useState(false);
+  const [hoveredCandle, setHoveredCandle] = useState<CandlestickData<UTCTimestamp> | null>(null);
+  const [visibleLastCandle, setVisibleLastCandle] = useState<CandlestickData<UTCTimestamp> | null>(null);
+
+  const clearPendingClick = () => {
+    if (pendingClickTimerRef.current !== null) {
+      window.clearTimeout(pendingClickTimerRef.current);
+      pendingClickTimerRef.current = null;
+    }
+    pendingClickEpochRef.current = null;
+  };
+
+  const applyMainSeriesMode = () => {
+    const candleSeries = candleSeriesRef.current;
+    const closeSeries = closeSeriesRef.current;
+    if (!candleSeries || !closeSeries) {
+      return;
+    }
+    const isLineChart = chartTypeRef.current === "Line Chart";
+    candleSeries.applyOptions({
+      upColor: isLineChart ? "rgba(8, 153, 129, 0)" : "#089981",
+      downColor: isLineChart ? "rgba(242, 54, 69, 0)" : "#f23645",
+      borderVisible: false,
+      wickUpColor: isLineChart ? "rgba(8, 153, 129, 0)" : "#089981",
+      wickDownColor: isLineChart ? "rgba(242, 54, 69, 0)" : "#f23645",
+      lastValueVisible: !isLineChart,
+      priceLineVisible: false,
+    });
+    closeSeries.applyOptions({
+      visible: isLineChart,
+      color: "#0f172a",
+      lineWidth: 2,
+      priceLineVisible: false,
+      lastValueVisible: isLineChart,
+      crosshairMarkerVisible: false,
+    });
+  };
 
   const getIsZoomed = (): boolean => {
     const chart = chartRef.current;
@@ -286,10 +358,6 @@ const Chart = ({
     if (!chart || candleData.length < 2) {
       return false;
     }
-    if (replayActiveRef.current) {
-      return true;
-    }
-
     const range = chart.timeScale().getVisibleRange();
     if (!range) {
       return false;
@@ -311,11 +379,6 @@ const Chart = ({
     Streamlit.setComponentValue({
       ...payload,
       zoomed: getIsZoomed(),
-      replayState: {
-        active: replayActiveRef.current,
-        index: replayIndexRef.current,
-        showStartLine: showReplayStartLineRef.current,
-      },
     });
   };
 
@@ -326,6 +389,115 @@ const Chart = ({
     }
     zoomedStateRef.current = zoomed;
     emitComponentEvent({ zoomed });
+  };
+
+  const drawSuperTrendFill = () => {
+    const canvas = overlayCanvasRef.current;
+    const container = containerRef.current;
+    const chart = chartRef.current;
+    const candleSeries = candleSeriesRef.current;
+    if (!canvas || !container || !chart || !candleSeries) {
+      return;
+    }
+
+    const width = Math.max(1, Math.round(container.clientWidth || 0));
+    const canvasHeight = Math.max(1, Math.round(height));
+    const dpr = window.devicePixelRatio || 1;
+    const pixelWidth = Math.max(1, Math.round(width * dpr));
+    const pixelHeight = Math.max(1, Math.round(canvasHeight * dpr));
+
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${canvasHeight}px`;
+    }
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return;
+    }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, width, canvasHeight);
+
+    const allIndicators = fullIndicatorDataRef.current;
+    const bullSeriesList = allIndicators.filter(
+      (item) => item.column === "Super Trend Bull" || item.id.includes(":bull")
+    );
+    const bearSeriesList = allIndicators.filter(
+      (item) => item.column === "Super Trend Bear" || item.id.includes(":bear")
+    );
+    if (bullSeriesList.length === 0 && bearSeriesList.length === 0) {
+      return;
+    }
+
+    const buildSegments = (
+      seriesList: Array<{
+        data: Array<LineData<UTCTimestamp> | WhitespaceData<UTCTimestamp>>;
+        color: string;
+      }>
+    ): Array<{ color: string; points: Array<{ x: number; trendY: number; closeY: number }> }> =>
+      seriesList
+        .map((series) => {
+          const points = series.data.reduce<Array<{ x: number; trendY: number; closeY: number }>>(
+            (accumulator, point) => {
+              if (!hasLineValue(point)) {
+                return accumulator;
+              }
+              const time = Number(point.time);
+              const candleIndex = candleIndexByTimeRef.current.get(time);
+              if (candleIndex === undefined) {
+                return accumulator;
+              }
+              const candle = fullCandleDataRef.current[candleIndex];
+              const x = chart.timeScale().timeToCoordinate(candle.time);
+              const trendY = candleSeries.priceToCoordinate(Number(point.value));
+              const closeY = candleSeries.priceToCoordinate(candle.close);
+              if (x === null || trendY === null || closeY === null) {
+                return accumulator;
+              }
+              accumulator.push({
+                x: Number(x),
+                trendY: Number(trendY),
+                closeY: Number(closeY),
+              });
+              return accumulator;
+            },
+            []
+          );
+          return { color: series.color, points };
+        })
+        .filter((item) => item.points.length > 1);
+
+    const drawSegments = (
+      segments: Array<{ color: string; points: Array<{ x: number; trendY: number; closeY: number }> }>
+    ) => {
+      for (const segment of segments) {
+        const yValues = segment.points.flatMap((point) => [point.trendY, point.closeY]);
+        const minY = Math.min(...yValues);
+        const maxY = Math.max(...yValues);
+        const gradient = ctx.createLinearGradient(0, minY, 0, maxY);
+        gradient.addColorStop(0, hexToRgba(segment.color, 0.02));
+        gradient.addColorStop(0.5, hexToRgba(segment.color, 0.12));
+        gradient.addColorStop(1, hexToRgba(segment.color, 0.24));
+
+        ctx.beginPath();
+        ctx.moveTo(segment.points[0].x, segment.points[0].trendY);
+        for (let i = 1; i < segment.points.length; i += 1) {
+          ctx.lineTo(segment.points[i].x, segment.points[i].trendY);
+        }
+        for (let i = segment.points.length - 1; i >= 0; i -= 1) {
+          ctx.lineTo(segment.points[i].x, segment.points[i].closeY);
+        }
+        ctx.closePath();
+        ctx.fillStyle = gradient;
+        ctx.fill();
+      }
+    };
+
+    drawSegments(buildSegments(bullSeriesList));
+    drawSegments(buildSegments(bearSeriesList));
   };
 
   const updateOverlayPositions = () => {
@@ -345,80 +517,71 @@ const Chart = ({
       []
     );
     setSessionBreakXs(nextSessionBreakXs);
-
-    if (replayActiveRef.current && replayIndexRef.current !== null && showReplayStartLineRef.current) {
-      const candle = fullCandleDataRef.current[replayIndexRef.current];
-      if (candle) {
-        const replayX = timeScale.timeToCoordinate(candle.time);
-        setReplayCursorX(replayX === null ? null : Number(replayX));
-      }
-    } else {
-      setReplayCursorX(null);
-    }
-  };
-
-  const setReplayWindow = (index: number) => {
-    const chart = chartRef.current;
-    const candleData = fullCandleDataRef.current;
-    if (!chart || candleData.length === 0) {
-      return;
-    }
-
-    const boundedIndex = Math.min(Math.max(index, 0), candleData.length - 1);
-    const interval = intervalRef.current || inferInterval(candleData);
-    const fromIndex = Math.max(0, boundedIndex - 80);
-    const from = candleData[fromIndex]?.time ?? candleData[0].time;
-    const to = (candleData[boundedIndex].time + interval * 8) as UTCTimestamp;
-    chart.timeScale().setVisibleRange({ from, to });
-    setTimeout(updateOverlayPositions, 0);
+    drawSuperTrendFill();
   };
 
   const applyVisibleData = (preserveRange: boolean) => {
     const chart = chartRef.current;
     const candleSeries = candleSeriesRef.current;
-    const emaSeries = emaSeriesRef.current;
-    if (!chart || !candleSeries || !emaSeries) {
+    const closeSeries = closeSeriesRef.current;
+    if (!chart || !candleSeries || !closeSeries) {
       return;
     }
 
     const allCandles = fullCandleDataRef.current;
-    const allEma = fullEmaDataRef.current;
+    const closeLineData = fullCloseLineDataRef.current;
+    const allIndicators = fullIndicatorDataRef.current;
     const allMarkers = fullMarkerDataRef.current;
     const currentRange = preserveRange ? chart.timeScale().getVisibleRange() : null;
-
-    let visibleCandles = allCandles;
-    let visibleEma = allEma;
-    let visibleMarkers = allMarkers;
-
-    if (replayActiveRef.current && replayIndexRef.current !== null && allCandles.length > 0) {
-      const replayIndex = Math.min(replayIndexRef.current, allCandles.length - 1);
-      const cutoffTime = allCandles[replayIndex].time;
-      visibleCandles = allCandles.slice(0, replayIndex + 1);
-      visibleEma = allEma.filter((item) => item.time <= cutoffTime);
-      visibleMarkers = allMarkers.filter((item) => item.time <= cutoffTime);
-    }
-
-    candleSeries.setData(visibleCandles);
-    emaSeries.setData(visibleEma);
-    candleSeries.setMarkers(visibleMarkers);
-
-    sessionBreakTimesRef.current = computeSessionBreakTimes(visibleCandles);
-
-    if (!replayActiveRef.current) {
-      if (!hasFitRef.current && visibleCandles.length > 0) {
-        chart.timeScale().fitContent();
-        hasFitRef.current = true;
-      } else if (currentRange) {
-        chart.timeScale().setVisibleRange(currentRange);
+    candleSeries.setData(allCandles);
+    closeSeries.setData(closeLineData);
+    applyMainSeriesMode();
+    const indicatorSeriesMap = indicatorSeriesRefs.current;
+    const nextIndicatorIds = new Set(allIndicators.map((item) => item.id));
+    for (const [seriesId, series] of Array.from(indicatorSeriesMap.entries())) {
+      if (!nextIndicatorIds.has(seriesId)) {
+        chart.removeSeries(series);
+        indicatorSeriesMap.delete(seriesId);
       }
-    } else if (replayIndexRef.current !== null) {
-      setReplayWindow(replayIndexRef.current);
+    }
+    for (const indicator of allIndicators) {
+      const safeLineWidth = Math.max(1, Math.min(4, Math.round(indicator.lineWidth))) as 1 | 2 | 3 | 4;
+      let series = indicatorSeriesMap.get(indicator.id);
+      if (!series) {
+        series = chart.addLineSeries({
+          color: indicator.color,
+          lineWidth: safeLineWidth,
+          priceLineVisible: false,
+          lastValueVisible: true,
+          crosshairMarkerVisible: false,
+        });
+        indicatorSeriesMap.set(indicator.id, series);
+      } else {
+        series.applyOptions({
+          color: indicator.color,
+          lineWidth: safeLineWidth,
+        });
+      }
+      series.setData(indicator.data);
+    }
+    if (chartTypeRef.current === "Line Chart") {
+      candleSeries.setMarkers([]);
+      closeSeries.setMarkers(allMarkers);
+    } else {
+      candleSeries.setMarkers(allMarkers);
+      closeSeries.setMarkers([]);
     }
 
-    if (!replayActiveRef.current) {
-      setReplayCursorX(null);
+    sessionBreakTimesRef.current = computeSessionBreakTimes(allCandles);
+
+    if (!hasFitRef.current && allCandles.length > 0) {
+      chart.timeScale().fitContent();
+      hasFitRef.current = true;
+    } else if (currentRange) {
+      chart.timeScale().setVisibleRange(currentRange);
     }
 
+    setVisibleLastCandle(allCandles.length > 0 ? allCandles[allCandles.length - 1] : null);
     updateOverlayPositions();
     emitZoomStateIfChanged();
     Streamlit.setFrameHeight(height);
@@ -428,24 +591,14 @@ const Chart = ({
     setModalMode(null);
   };
 
-  const openDateModal = (mode: Exclude<ModalMode, null>) => {
+  const openDateModal = () => {
     const lastTs = lastCandleTsRef.current;
     if (lastTs) {
       const d = new Date(lastTs * 1000);
       const pad = (value: number) => String(value).padStart(2, "0");
       setDateValue(`${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`);
     }
-    setModalMode(mode);
-  };
-
-  const resetReplay = () => {
-    replayIndexRef.current = null;
-    replayActiveRef.current = false;
-    showReplayStartLineRef.current = false;
-    setReplayActive(false);
-    setShowReplayStartLine(false);
-    applyVisibleData(false);
-    emitComponentEvent({ eventType: "replay_state" });
+    setModalMode("goto");
   };
 
   const resetCurrentView = () => {
@@ -454,41 +607,8 @@ const Chart = ({
       return;
     }
 
-    if (replayActiveRef.current && replayIndexRef.current !== null) {
-      setReplayWindow(replayIndexRef.current);
-      return;
-    }
-
     chart.timeScale().fitContent();
     setTimeout(updateOverlayPositions, 0);
-  };
-
-  const startReplayFromDate = (selectedDate: string) => {
-    const allCandles = fullCandleDataRef.current;
-    if (allCandles.length === 0) {
-      closeModal();
-      return;
-    }
-
-    const targetSessionStart = sessionStartTimestamp(selectedDate);
-    const selectedDay = selectedDate;
-
-    let index = allCandles.findIndex((item) => dayKey(item.time) === selectedDay);
-    if (index < 0 && targetSessionStart !== null) {
-      index = allCandles.findIndex((item) => item.time >= targetSessionStart);
-    }
-    if (index < 0) {
-      index = allCandles.length - 1;
-    }
-
-    replayIndexRef.current = index;
-    replayActiveRef.current = true;
-    showReplayStartLineRef.current = true;
-    setReplayActive(true);
-    setShowReplayStartLine(true);
-    applyVisibleData(false);
-    emitComponentEvent({ eventType: "replay_state" });
-    closeModal();
   };
 
   const goToDate = (selectedDate: string) => {
@@ -513,25 +633,9 @@ const Chart = ({
       from: (ts - span / 2) as UTCTimestamp,
       to: (ts + span / 2) as UTCTimestamp,
     });
+    clearPendingClick();
+    emitComponentEvent({ eventType: "view_reset" });
     closeModal();
-  };
-
-  const stepReplayForward = () => {
-    if (!replayActiveRef.current) {
-      return;
-    }
-    const allCandles = fullCandleDataRef.current;
-    if (allCandles.length === 0 || replayIndexRef.current === null) {
-      return;
-    }
-    if (replayIndexRef.current >= allCandles.length - 1) {
-      return;
-    }
-    showReplayStartLineRef.current = false;
-    setShowReplayStartLine(false);
-    replayIndexRef.current += 1;
-    applyVisibleData(false);
-    emitComponentEvent({ eventType: "replay_state" });
   };
 
   useEffect(() => {
@@ -616,18 +720,86 @@ const Chart = ({
       priceLineVisible: false,
       lastValueVisible: true,
     });
-
-    const emaSeries = chart.addLineSeries({
-      color: "#2962ff",
+    const closeSeries = chart.addLineSeries({
+      visible: false,
+      color: "#0f172a",
       lineWidth: 2,
       priceLineVisible: false,
-      lastValueVisible: true,
+      lastValueVisible: false,
       crosshairMarkerVisible: false,
+    });
+    applyMainSeriesMode();
+
+    chart.subscribeCrosshairMove((param) => {
+      const candleSeries = candleSeriesRef.current;
+      if (!candleSeries || !param.point || !param.time) {
+        setHoveredCandle(null);
+        return;
+      }
+
+      const candlePoint = param.seriesData?.get?.(candleSeries) as
+        | CandlestickData<UTCTimestamp>
+        | undefined;
+      if (candlePoint) {
+        setHoveredCandle(candlePoint);
+        return;
+      }
+      const hoveredTs = toTimestampAny(param.time);
+      if (hoveredTs === null) {
+        setHoveredCandle(null);
+        return;
+      }
+      const candleIndex = candleIndexByTimeRef.current.get(Number(hoveredTs));
+      setHoveredCandle(
+        candleIndex === undefined ? null : fullCandleDataRef.current[candleIndex] ?? null
+      );
     });
 
     chart.subscribeClick((param) => {
-      const clicked = toTimestampAny(param.time as Time | undefined);
+      const candleSeries = candleSeriesRef.current;
+      const point = param.point;
+      const clicked =
+        toTimestampAny(param.time as Time | undefined) ??
+        toTimestampAny(chart.timeScale().coordinateToTime(point?.x ?? 0));
+      if (!candleSeries || !point || clicked === null) {
+        return;
+      }
+
+      let candlePoint = param.seriesData?.get?.(candleSeries) as
+        | CandlestickData<UTCTimestamp>
+        | undefined;
+      if (!candlePoint) {
+        const candleIndex = candleIndexByTimeRef.current.get(Number(clicked));
+        candlePoint =
+          candleIndex === undefined ? undefined : fullCandleDataRef.current[candleIndex];
+      }
+      if (!candlePoint) {
+        return;
+      }
+
+      const candleX = chart.timeScale().timeToCoordinate(candlePoint.time);
+      const openY = candleSeries.priceToCoordinate(candlePoint.open);
+      const closeY = candleSeries.priceToCoordinate(candlePoint.close);
+      const highY = candleSeries.priceToCoordinate(candlePoint.high);
+      const lowY = candleSeries.priceToCoordinate(candlePoint.low);
       if (clicked === null) {
+        return;
+      }
+      if (
+        candleX === null ||
+        openY === null ||
+        closeY === null ||
+        highY === null ||
+        lowY === null
+      ) {
+        return;
+      }
+
+      const withinX = Math.abs(point.x - candleX) <= 9;
+      const wickTop = Math.min(highY, lowY) - 3;
+      const wickBottom = Math.max(highY, lowY) + 3;
+      const withinY = point.y >= wickTop && point.y <= wickBottom;
+      if (!withinX || !withinY) {
         return;
       }
 
@@ -663,7 +835,7 @@ const Chart = ({
 
     chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
-    emaSeriesRef.current = emaSeries;
+    closeSeriesRef.current = closeSeries;
     resetViewRef.current = resetCurrentView;
 
     const handleResize = () => {
@@ -679,17 +851,13 @@ const Chart = ({
       const key = event.key.toLowerCase();
       if (event.altKey && key === "g") {
         event.preventDefault();
-        openDateModal("goto");
+        openDateModal();
         return;
       }
       if (event.altKey && key === "r") {
         event.preventDefault();
         resetViewRef.current?.();
         return;
-      }
-      if (event.shiftKey && event.key === "ArrowRight") {
-        event.preventDefault();
-        stepReplayForward();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
@@ -713,27 +881,40 @@ const Chart = ({
       window.removeEventListener("keydown", handleKeyDown);
       document.removeEventListener("keydown", handleKeyDown);
       container.removeEventListener("click", handleFocusClick);
-      if (pendingClickTimerRef.current !== null) {
-        window.clearTimeout(pendingClickTimerRef.current);
-        pendingClickTimerRef.current = null;
-        pendingClickEpochRef.current = null;
-      }
+      clearPendingClick();
+      indicatorSeriesRefs.current.forEach((series) => {
+        chart.removeSeries(series);
+      });
+      indicatorSeriesRefs.current.clear();
       chart.timeScale().unsubscribeVisibleTimeRangeChange(handleVisibleRangeChange);
       chart.remove();
       chartRef.current = null;
       candleSeriesRef.current = null;
-      emaSeriesRef.current = null;
+      closeSeriesRef.current = null;
       resetViewRef.current = null;
       sessionBreakTimesRef.current = [];
       setSessionBreakXs([]);
-      setReplayCursorX(null);
+      setHoveredCandle(null);
+      setVisibleLastCandle(null);
     };
   }, [height]);
 
   useEffect(() => {
     fullCandleDataRef.current = normalizeCandles(candles);
-    fullEmaDataRef.current = normalizeEma(ema);
+    fullCloseLineDataRef.current = buildCloseLineData(fullCandleDataRef.current);
+    fullIndicatorDataRef.current = indicators.map((indicator) => ({
+      id: indicator.id,
+      name: indicator.name,
+      column: indicator.column,
+      color: indicator.color ?? "#2962ff",
+      lineWidth: indicator.lineWidth ?? 2,
+      data: normalizeLineSeries(indicator.data ?? []),
+    }));
     fullMarkerDataRef.current = normalizeMarkers(markers);
+    chartTypeRef.current = chartType;
+    candleIndexByTimeRef.current = new Map(
+      fullCandleDataRef.current.map((item, index) => [Number(item.time), index])
+    );
     intervalRef.current = inferInterval(fullCandleDataRef.current);
 
     if (fullCandleDataRef.current.length > 0) {
@@ -743,116 +924,88 @@ const Chart = ({
       lastCandleTsRef.current = null;
     }
 
-    if (
-      replayActiveRef.current &&
-      replayIndexRef.current !== null &&
-      replayIndexRef.current >= fullCandleDataRef.current.length
-    ) {
-      replayIndexRef.current = Math.max(0, fullCandleDataRef.current.length - 1);
-    }
-
+    setHoveredCandle(null);
     applyVisibleData(true);
-  }, [candles, ema, markers, height]);
-
-  useEffect(() => {
-    const nextReplayState = normalizeReplayState(replayState);
-    const maxIndex =
-      fullCandleDataRef.current.length > 0 ? fullCandleDataRef.current.length - 1 : null;
-    const nextIndex =
-      nextReplayState.active && nextReplayState.index !== null && maxIndex !== null
-        ? Math.min(nextReplayState.index, maxIndex)
-        : nextReplayState.active
-          ? nextReplayState.index
-          : null;
-
-    const changed =
-      replayActiveRef.current !== nextReplayState.active ||
-      replayIndexRef.current !== nextIndex ||
-      showReplayStartLineRef.current !== nextReplayState.showStartLine;
-
-    if (!changed) {
-      return;
-    }
-
-    replayActiveRef.current = nextReplayState.active;
-    replayIndexRef.current = nextIndex;
-    showReplayStartLineRef.current = nextReplayState.showStartLine;
-    setReplayActive(nextReplayState.active);
-    setShowReplayStartLine(nextReplayState.showStartLine);
-    applyVisibleData(true);
-  }, [replayState]);
+  }, [candles, indicators, markers, chartType, height]);
 
   const handleDateSubmit = () => {
     if (!dateValue) {
       closeModal();
       return;
     }
-    if (modalMode === "goto") {
-      goToDate(dateValue);
-      return;
-    }
-    if (modalMode === "replay") {
-      startReplayFromDate(dateValue);
-      return;
-    }
+    goToDate(dateValue);
   };
 
-  const handleReplayButtonClick = () => {
-    if (replayActive) {
-      setModalMode("leaveReplay");
-      return;
-    }
-    openDateModal("replay");
-  };
-
+  const displayCandle = hoveredCandle ?? visibleLastCandle;
+  const ohlcColor =
+    displayCandle && displayCandle.close >= displayCandle.open ? "#089981" : "#f23645";
+  const previousClose =
+    displayCandle !== null
+      ? (() => {
+          const candleIndex = candleIndexByTimeRef.current.get(Number(displayCandle.time));
+          if (candleIndex === undefined || candleIndex <= 0) {
+            return null;
+          }
+          return fullCandleDataRef.current[candleIndex - 1]?.close ?? null;
+        })()
+      : null;
+  const changeValue =
+    displayCandle !== null && previousClose !== null ? displayCandle.close - previousClose : null;
+  const percentChange =
+    changeValue !== null && previousClose !== null && previousClose !== 0
+      ? (changeValue / previousClose) * 100
+      : null;
+  const changePrefix = changeValue !== null && changeValue > 0 ? "+" : "";
   return (
     <div style={{ position: "relative", width: "100%", height }}>
-      <div
-        style={{
-          position: "absolute",
-          top: 10,
-          left: 10,
-          zIndex: 6,
-          display: "flex",
-          gap: "8px",
-          alignItems: "center",
-        }}
-      >
-        <button
-          onClick={handleReplayButtonClick}
+      {displayCandle && (
+        <div
           style={{
-            display: "inline-flex",
+            position: "absolute",
+            top: 10,
+            left: 12,
+            zIndex: 6,
+            display: "flex",
+            gap: "10px",
             alignItems: "center",
-            gap: "6px",
-            padding: "6px 10px",
-            borderRadius: "8px",
-            border: "1px solid #cbd5e1",
-            background: "rgba(255,255,255,0.95)",
-            color: "#0f172a",
-            fontWeight: 600,
-            cursor: "pointer",
+            color: ohlcColor,
+            fontSize: "17.5px",
+            fontWeight: 700,
+            fontFamily: "Consolas, 'Courier New', monospace",
+            letterSpacing: "0.01em",
+            background: "rgba(255,255,255,0.72)",
+            padding: "4px 8px",
+            borderRadius: "6px",
+            pointerEvents: "none",
+            flexWrap: "wrap",
           }}
         >
-          <span>{replayActive ? "x" : "<<"}</span>
-          <span>{replayActive ? "Exit Replay" : "Replay"}</span>
-        </button>
-        {replayActive && (
-          <div
-            style={{
-              padding: "6px 10px",
-              borderRadius: "8px",
-              background: "rgba(37, 99, 235, 0.12)",
-              color: "#1d4ed8",
-              fontSize: "12px",
-              fontWeight: 700,
-            }}
-          >
-            Shift + Right Arrow
-          </div>
-        )}
-      </div>
+          <span>O {formatOhlcValue(displayCandle.open)}</span>
+          <span>H {formatOhlcValue(displayCandle.high)}</span>
+          <span>L {formatOhlcValue(displayCandle.low)}</span>
+          <span>C {formatOhlcValue(displayCandle.close)}</span>
+          {changeValue !== null && percentChange !== null && (
+            <span>
+              {changePrefix}
+              {formatOhlcValue(changeValue)} ({changePrefix}
+              {percentChange.toFixed(2)}%)
+            </span>
+          )}
+        </div>
+      )}
 
       <div ref={containerRef} style={{ width: "100%", height: "100%" }} />
+      <canvas
+        ref={overlayCanvasRef}
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+          pointerEvents: "none",
+          zIndex: 3,
+        }}
+      />
 
       {sessionBreakXs.map((x, index) => (
         <div
@@ -868,20 +1021,6 @@ const Chart = ({
           }}
         />
       ))}
-
-      {replayCursorX !== null && (
-        <div
-          style={{
-            position: "absolute",
-            top: 0,
-            bottom: 0,
-            left: `${replayCursorX}px`,
-            borderLeft: "2px solid #2563eb",
-            pointerEvents: "none",
-            zIndex: 3,
-          }}
-        />
-      )}
 
       {modalMode && (
         <div
@@ -904,98 +1043,50 @@ const Chart = ({
               minWidth: "280px",
             }}
           >
-            {modalMode === "leaveReplay" ? (
-              <>
-                <div style={{ fontWeight: 700, marginBottom: "8px", fontSize: "22px" }}>
-                  Leave current replay?
-                </div>
-                <div style={{ color: "#475569", marginBottom: "16px", lineHeight: 1.5 }}>
-                  This will exit replay mode and restore the full chart.
-                </div>
-                <div style={{ display: "flex", gap: "8px", justifyContent: "flex-end" }}>
-                  <button
-                    onClick={closeModal}
-                    style={{
-                      padding: "8px 16px",
-                      borderRadius: "6px",
-                      border: "1px solid #cbd5e1",
-                      background: "white",
-                      color: "#0f172a",
-                      fontWeight: 700,
-                      cursor: "pointer",
-                    }}
-                  >
-                    Stay
-                  </button>
-                  <button
-                    onClick={() => {
-                      closeModal();
-                      resetReplay();
-                    }}
-                    style={{
-                      padding: "8px 16px",
-                      borderRadius: "6px",
-                      border: "none",
-                      background: "#111827",
-                      color: "white",
-                      fontWeight: 700,
-                      cursor: "pointer",
-                    }}
-                  >
-                    Leave
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                <div style={{ fontWeight: 700, marginBottom: "8px" }}>
-                  {modalMode === "goto" ? "Go to Date" : "Replay From Date"}
-                </div>
-                <input
-                  type="date"
-                  value={dateValue}
-                  onChange={(event) => setDateValue(event.target.value)}
-                  style={{
-                    width: "100%",
-                    padding: "8px",
-                    borderRadius: "6px",
-                    border: "1px solid #cbd5e1",
-                  }}
-                />
-                <div style={{ display: "flex", gap: "8px", marginTop: "12px" }}>
-                  <button
-                    onClick={handleDateSubmit}
-                    style={{
-                      flex: 1,
-                      padding: "8px",
-                      borderRadius: "6px",
-                      border: "none",
-                      background: "#2563eb",
-                      color: "white",
-                      fontWeight: 700,
-                      cursor: "pointer",
-                    }}
-                  >
-                    {modalMode === "goto" ? "Go" : "Start Replay"}
-                  </button>
-                  <button
-                    onClick={closeModal}
-                    style={{
-                      flex: 1,
-                      padding: "8px",
-                      borderRadius: "6px",
-                      border: "1px solid #cbd5e1",
-                      background: "white",
-                      color: "#0f172a",
-                      fontWeight: 700,
-                      cursor: "pointer",
-                    }}
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </>
-            )}
+            <div style={{ fontWeight: 700, marginBottom: "8px" }}>Go to Date</div>
+            <input
+              type="date"
+              value={dateValue}
+              onChange={(event) => setDateValue(event.target.value)}
+              style={{
+                width: "100%",
+                padding: "8px",
+                borderRadius: "6px",
+                border: "1px solid #cbd5e1",
+              }}
+            />
+            <div style={{ display: "flex", gap: "8px", marginTop: "12px" }}>
+              <button
+                onClick={handleDateSubmit}
+                style={{
+                  flex: 1,
+                  padding: "8px",
+                  borderRadius: "6px",
+                  border: "none",
+                  background: "#2563eb",
+                  color: "white",
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                Go
+              </button>
+              <button
+                onClick={closeModal}
+                style={{
+                  flex: 1,
+                  padding: "8px",
+                  borderRadius: "6px",
+                  border: "1px solid #cbd5e1",
+                  background: "white",
+                  color: "#0f172a",
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                Cancel
+              </button>
+            </div>
           </div>
         </div>
       )}

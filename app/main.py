@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import calendar
 import html
+import json
+import os
+import re
 from io import BytesIO
 import shutil
 import subprocess
@@ -30,12 +33,22 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Image, LongTable, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 from .component import tv_chart_component, build_dir
-from .data_pipeline import extract_symbol, process_raw_folder
-from .google_drive import (
-    download_google_drive_files_to_dir,
-    get_google_drive_connection_status,
-    list_google_drive_folder_files,
-    upload_google_drive_file,
+from .data_pipeline import (
+    InstrumentIdentity,
+    default_indicator_label,
+    extract_symbol,
+    format_timeframe_label,
+    inspect_indicator_requirements,
+    normalize_indicator_family,
+    parse_instrument_identity,
+    process_raw_folder,
+    select_primary_ema_column,
+)
+from .github_update import (
+    fetch_latest_release_info,
+    is_newer_version,
+    launch_update_installer,
+    load_app_version_info,
 )
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -67,14 +80,24 @@ SELL_DARK_COLOR = "#b91c1c"
 EMA_COLOR = "#2962ff"
 GRID_COLOR = "rgba(209, 213, 219, 0.55)"
 SIDEBAR_BG = "#f6f8fb"
-MAX_CANDLES = 3000
+MAX_CANDLES = 5000
 DEFAULT_RECENT_DAYS = 5
-TIMEFRAME_TEXT = "3 minute candles"
-TIMEFRAME_LABEL = "3m"
-SESSION_START = "09.15"
-SESSION_END = "15.27"
+TIMEFRAME_TEXT = "Timeframe based on file"
 CHART_HEIGHT = 700
+DEFAULT_DRIVE_OUTPUT_DIR = Path(r"G:\My Drive\H&L\EMA 200 TRADES\Main Folder\Output Files")
 SUPPORTED_DATA_EXTENSIONS = (".csv", ".xlsx", ".xlsm", ".xlsb")
+INDICATOR_CONFIG_FILE_NAME = ".indicator_requirements.json"
+DEFAULT_STRATEGY_NAME = "Current"
+INDICATOR_LINE_WIDTH_OPTIONS = {
+    "thin": 1,
+    "medium": 2,
+    "thick": 4,
+}
+INDICATOR_LINE_WIDTH_LABELS = {
+    "thin": "Thin",
+    "medium": "Medium",
+    "thick": "Thick",
+}
 SAVED_SIGNAL_COLUMNS = [
     "Symbol",
     "Date",
@@ -148,16 +171,42 @@ def next_month_end(value: Any):
     return pd.Timestamp(year=year, month=month, day=last_day).date()
 
 
-def compute_chart_window_end(start_date: Any, limit_date: Any):
+def compute_chart_window_end(df: pd.DataFrame, start_date: Any, limit_date: Any):
     start = pd.Timestamp(start_date).date()
     limit = pd.Timestamp(limit_date).date()
-    if start == month_start(start):
-        return min(limit, month_end(start))
-    return min(limit, next_month_end(start))
+    if start > limit:
+        return limit
+
+    filtered_df = df.loc[
+        (df["Timestamp"].dt.date >= start) & (df["Timestamp"].dt.date <= limit),
+        ["Timestamp"],
+    ]
+    if filtered_df.empty:
+        return limit
+
+    if len(filtered_df) <= MAX_CANDLES:
+        return pd.Timestamp(filtered_df.iloc[-1]["Timestamp"]).date()
+
+    return pd.Timestamp(filtered_df.iloc[MAX_CANDLES - 1]["Timestamp"]).date()
 
 
-SESSION_START_MINUTES = time_to_minutes(SESSION_START)
-SESSION_END_MINUTES = time_to_minutes(SESSION_END)
+def compute_chart_window_start(df: pd.DataFrame, start_limit_date: Any, end_date: Any):
+    start_limit = pd.Timestamp(start_limit_date).date()
+    end = pd.Timestamp(end_date).date()
+    if end < start_limit:
+        return start_limit
+
+    filtered_df = df.loc[
+        (df["Timestamp"].dt.date >= start_limit) & (df["Timestamp"].dt.date <= end),
+        ["Timestamp"],
+    ]
+    if filtered_df.empty:
+        return start_limit
+
+    if len(filtered_df) <= MAX_CANDLES:
+        return pd.Timestamp(filtered_df.iloc[0]["Timestamp"]).date()
+
+    return pd.Timestamp(filtered_df.iloc[-MAX_CANDLES]["Timestamp"]).date()
 
 
 def is_supported_data_file(file_path: Path) -> bool:
@@ -174,33 +223,8 @@ def list_supported_data_files(folder: Path) -> list[Path]:
     ]
 
 
-def filter_supported_google_drive_files(file_infos: list[Any]) -> list[Any]:
-    supported_files: list[Any] = []
-    for file_info in file_infos:
-        suffix = Path(str(getattr(file_info, "name", ""))).suffix.lower()
-        if suffix in SUPPORTED_DATA_EXTENSIONS:
-            supported_files.append(file_info)
-    return supported_files
-
-
-def group_google_drive_files_by_symbol(file_infos: list[Any]) -> dict[str, list[Any]]:
-    grouped_files: dict[str, list[Any]] = {}
-    for file_info in file_infos:
-        symbol = extract_symbol(str(getattr(file_info, "name", "")))
-        grouped_files.setdefault(symbol, []).append(file_info)
-    return dict(sorted(grouped_files.items(), key=lambda item: item[0].lower()))
-
-
 def display_symbol(symbol: Any) -> str:
     return str(symbol or "").upper()
-
-
-def trigger_drive_process_dialog() -> None:
-    choice = st.session_state.get("drive_process_choice_widget")
-    if choice == "Yes":
-        st.session_state.show_drive_process_dialog = True
-    elif choice == "No":
-        st.session_state.drive_input_sync_choice = None
 
 
 def read_tabular_file(file_path: Path) -> pd.DataFrame:
@@ -256,6 +280,92 @@ def remove_other_matching_data_files(folder: Path, stem: str, keep_path: Path) -
             continue
 
 
+def rename_file_preserving_case(source_path: Path, target_path: Path) -> Path:
+    if source_path.resolve() == target_path.resolve() and source_path.name == target_path.name:
+        return source_path
+    if source_path.name.casefold() == target_path.name.casefold():
+        temp_path = source_path.with_name(f"{source_path.stem}.__tmp__{uuid4().hex}{source_path.suffix}")
+        source_path.rename(temp_path)
+        temp_path.rename(target_path)
+        return target_path
+    source_path.rename(target_path)
+    return target_path
+
+
+def session_range_label(df: pd.DataFrame) -> str:
+    if df.empty or "Time" not in df.columns:
+        return "Session: No data"
+    time_values = df["Time"].dropna().astype(str).str.strip()
+    if time_values.empty:
+        return "Session: No data"
+    return f"Session: {time_values.iloc[0].replace('.', ':')} - {time_values.iloc[-1].replace('.', ':')}"
+
+
+def sanitize_strategy_name(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r'[<>:"/\\\\|?*]+', " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def strategy_output_dir(output_dir: Path, strategy_name: str) -> Path:
+    safe_name = sanitize_strategy_name(strategy_name)
+    if not safe_name or safe_name.casefold() == DEFAULT_STRATEGY_NAME.casefold():
+        return output_dir
+    return output_dir / safe_name
+
+
+def list_strategy_names(output_dir: Path) -> list[str]:
+    names = [DEFAULT_STRATEGY_NAME]
+    if output_dir.exists() and output_dir.is_dir():
+        for child in sorted(output_dir.iterdir(), key=lambda item: item.name.lower()):
+            if child.is_dir():
+                safe_name = sanitize_strategy_name(child.name)
+                if safe_name and safe_name.casefold() != DEFAULT_STRATEGY_NAME.casefold():
+                    names.append(safe_name)
+    return list(dict.fromkeys(names))
+
+
+def find_existing_strategy_match(output_dir: Path, strategy_names: list[str], signal_storage_stem: str) -> list[tuple[str, Path, Path]]:
+    matches: list[tuple[str, Path, Path]] = []
+    for strategy_name in strategy_names:
+        if sanitize_strategy_name(strategy_name).casefold() == DEFAULT_STRATEGY_NAME.casefold():
+            continue
+        candidate_dir = strategy_output_dir(output_dir, strategy_name)
+        candidate_path = find_data_file_by_stem(candidate_dir, signal_storage_stem)
+        if candidate_path and candidate_path.exists() and candidate_path.stat().st_size > 0:
+            matches.append((strategy_name, candidate_dir, candidate_path))
+    return matches
+
+
+def indicator_line_width_label(width_value: Any) -> str:
+    try:
+        width_number = int(width_value)
+    except (TypeError, ValueError):
+        width_number = INDICATOR_LINE_WIDTH_OPTIONS["medium"]
+    for key, value in INDICATOR_LINE_WIDTH_OPTIONS.items():
+        if value == width_number:
+            return INDICATOR_LINE_WIDTH_LABELS[key]
+    return INDICATOR_LINE_WIDTH_LABELS["medium"]
+
+
+def indicator_line_width_value(label: Any) -> int:
+    label_text = str(label or "").strip().lower()
+    for key, display_label in INDICATOR_LINE_WIDTH_LABELS.items():
+        if label_text == display_label.lower():
+            return INDICATOR_LINE_WIDTH_OPTIONS[key]
+    return INDICATOR_LINE_WIDTH_OPTIONS["medium"]
+
+
+def build_instrument_delete_stems(symbol: str, timeframe_options: list[str], instrument_key: str) -> list[str]:
+    stems = [instrument_key]
+    if len(set(str(item) for item in timeframe_options if str(item).strip())) <= 1:
+        stems.append(str(symbol or "").capitalize())
+    return list(dict.fromkeys([stem for stem in stems if str(stem).strip()]))
+
+
 def tabular_mime_type(file_path: Path) -> str:
     suffix = file_path.suffix.lower()
     if suffix == ".csv":
@@ -265,29 +375,51 @@ def tabular_mime_type(file_path: Path) -> str:
     return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-def normalize_chart_replay_state(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {"active": False, "index": None, "showStartLine": False}
-
-    active = bool(value.get("active"))
-    raw_index = value.get("index")
-    try:
-        index = None if raw_index is None else max(0, int(raw_index))
-    except (TypeError, ValueError):
-        index = None
-
-    show_start_line = active and bool(value.get("showStartLine"))
-    return {
-        "active": active,
-        "index": index if active else None,
-        "showStartLine": show_start_line,
-    }
-
-
 @st.cache_data(show_spinner=False)
 def list_symbols(data_dir: str) -> dict[str, str]:
     folder = Path(data_dir)
     return {file_path.stem: str(file_path) for file_path in list_supported_data_files(folder)}
+
+
+def instrument_sort_key(identity: InstrumentIdentity) -> tuple[str, int, str]:
+    timeframe_digits = re.search(r"(\d+)", identity.timeframe_label)
+    timeframe_order = int(timeframe_digits.group(1)) if timeframe_digits else 9999
+    return (identity.symbol.upper(), timeframe_order, identity.exchange.upper())
+
+
+@st.cache_data(show_spinner=False)
+def list_instruments(data_dir: str) -> list[dict[str, str]]:
+    folder = Path(data_dir)
+    instruments_by_identity: dict[tuple[str, str, str], dict[str, str]] = {}
+    for file_path in list_supported_data_files(folder):
+        identity = parse_instrument_identity(file_path.name)
+        instrument = {
+            "key": file_path.stem,
+            "exchange": identity.exchange,
+            "symbol": identity.symbol.upper(),
+            "timeframe_label": identity.timeframe_label,
+            "timeframe_value": identity.timeframe_value,
+            "path": str(file_path),
+        }
+        dedupe_key = (
+            str(instrument["exchange"]),
+            str(instrument["symbol"]),
+            str(instrument["timeframe_label"]),
+        )
+        existing = instruments_by_identity.get(dedupe_key)
+        if existing is None or "__" in file_path.stem:
+            instruments_by_identity[dedupe_key] = instrument
+    instruments = list(instruments_by_identity.values())
+    instruments.sort(
+        key=lambda item: (
+            str(item["symbol"]).upper(),
+            int(re.search(r"(\d+)", str(item["timeframe_label"])).group(1))
+            if re.search(r"(\d+)", str(item["timeframe_label"]))
+            else 9999,
+            str(item["exchange"]).upper(),
+        )
+    )
+    return instruments
 
 
 def resolve_data_dir(path_value: str) -> Path:
@@ -307,6 +439,167 @@ def resolve_main_workspace_dir(path_value: str) -> Path:
     if folder.name in {"Raw Files", "Input Files", "Output Files"}:
         return folder.parent
     return folder
+
+
+def indicator_config_path(main_dir: Path) -> Path:
+    return Path(main_dir) / INDICATOR_CONFIG_FILE_NAME
+
+
+def empty_indicator_config() -> dict[str, Any]:
+    return {
+        "column_labels": {},
+        "indicator_colors": {},
+        "indicator_display_names": {},
+        "indicator_enabled": {},
+        "indicator_line_widths": {},
+        "default_strategy": DEFAULT_STRATEGY_NAME,
+    }
+
+
+def load_indicator_config(main_dir: Path) -> dict[str, Any]:
+    config_path = indicator_config_path(main_dir)
+    if not config_path.exists():
+        return empty_indicator_config()
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return empty_indicator_config()
+    if not isinstance(payload, dict):
+        return empty_indicator_config()
+    column_labels = payload.get("column_labels")
+    if not isinstance(column_labels, dict):
+        payload["column_labels"] = {}
+    else:
+        payload["column_labels"] = {
+            str(key).strip(): str(value).strip()
+            for key, value in column_labels.items()
+            if str(key).strip() and str(value).strip()
+        }
+    indicator_colors = payload.get("indicator_colors")
+    if not isinstance(indicator_colors, dict):
+        payload["indicator_colors"] = {}
+    else:
+        payload["indicator_colors"] = {
+            str(key).strip(): str(value).strip()
+            for key, value in indicator_colors.items()
+            if str(key).strip() and str(value).strip()
+        }
+    indicator_display_names = payload.get("indicator_display_names")
+    if not isinstance(indicator_display_names, dict):
+        payload["indicator_display_names"] = {}
+    else:
+        payload["indicator_display_names"] = {
+            str(key).strip(): str(value).strip()
+            for key, value in indicator_display_names.items()
+            if str(key).strip() and str(value).strip()
+        }
+    indicator_enabled = payload.get("indicator_enabled")
+    if not isinstance(indicator_enabled, dict):
+        payload["indicator_enabled"] = {}
+    else:
+        payload["indicator_enabled"] = {
+            str(key).strip(): bool(value)
+            for key, value in indicator_enabled.items()
+            if str(key).strip()
+        }
+    indicator_line_widths = payload.get("indicator_line_widths")
+    if not isinstance(indicator_line_widths, dict):
+        payload["indicator_line_widths"] = {}
+    else:
+        payload["indicator_line_widths"] = {
+            str(key).strip(): int(value)
+            for key, value in indicator_line_widths.items()
+            if str(key).strip() and str(value).strip() and str(value).strip().isdigit()
+        }
+    default_strategy = str(payload.get("default_strategy") or "").strip()
+    payload["default_strategy"] = default_strategy or DEFAULT_STRATEGY_NAME
+    return payload
+
+
+def save_indicator_config(main_dir: Path, config: dict[str, Any]) -> None:
+    config_path = indicator_config_path(main_dir)
+    payload = {
+        "column_labels": {
+            str(key).strip(): str(value).strip()
+            for key, value in dict(config.get("column_labels") or {}).items()
+            if str(key).strip() and str(value).strip()
+        },
+        "indicator_colors": {
+            str(key).strip(): str(value).strip()
+            for key, value in dict(config.get("indicator_colors") or {}).items()
+            if str(key).strip() and str(value).strip()
+        },
+        "indicator_display_names": {
+            str(key).strip(): str(value).strip()
+            for key, value in dict(config.get("indicator_display_names") or {}).items()
+            if str(key).strip() and str(value).strip()
+        },
+        "indicator_enabled": {
+            str(key).strip(): bool(value)
+            for key, value in dict(config.get("indicator_enabled") or {}).items()
+            if str(key).strip()
+        },
+        "indicator_line_widths": {
+            str(key).strip(): max(1, min(4, int(value)))
+            for key, value in dict(config.get("indicator_line_widths") or {}).items()
+            if str(key).strip() and str(value).strip().isdigit()
+        },
+        "default_strategy": str(config.get("default_strategy") or DEFAULT_STRATEGY_NAME).strip() or DEFAULT_STRATEGY_NAME,
+    }
+    config_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def get_indicator_label_config(main_dir: Path) -> dict[str, str]:
+    return dict(load_indicator_config(main_dir).get("column_labels") or {})
+
+
+def get_indicator_color_config(main_dir: Path) -> dict[str, str]:
+    return dict(load_indicator_config(main_dir).get("indicator_colors") or {})
+
+
+def get_indicator_display_name_config(main_dir: Path) -> dict[str, str]:
+    return dict(load_indicator_config(main_dir).get("indicator_display_names") or {})
+
+
+def get_indicator_enabled_config(main_dir: Path) -> dict[str, bool]:
+    return dict(load_indicator_config(main_dir).get("indicator_enabled") or {})
+
+
+def get_indicator_line_width_config(main_dir: Path) -> dict[str, int]:
+    return dict(load_indicator_config(main_dir).get("indicator_line_widths") or {})
+
+
+def get_default_strategy_name(main_dir: Path) -> str:
+    return str(load_indicator_config(main_dir).get("default_strategy") or DEFAULT_STRATEGY_NAME).strip() or DEFAULT_STRATEGY_NAME
+
+
+def get_unresolved_indicator_requirements(raw_dir: Path, main_dir: Path) -> list[dict[str, Any]]:
+    requirements = inspect_indicator_requirements(raw_dir)
+    if not requirements:
+        return []
+    configured_labels = get_indicator_label_config(main_dir)
+    unresolved: list[dict[str, Any]] = []
+    for requirement in requirements:
+        columns = [str(column).strip() for column in requirement.get("columns", []) if str(column).strip()]
+        labels = [str(configured_labels.get(column) or "").strip() for column in columns]
+        if len(columns) <= 1:
+            continue
+        if any(not label for label in labels) or len(set(labels)) != len(labels):
+            unresolved.append(
+                {
+                    "family_key": str(requirement.get("family_key") or ""),
+                    "family_label": str(requirement.get("family_label") or "Indicator"),
+                    "columns": columns,
+                }
+            )
+    return unresolved
+
+
+def indicator_key_for_widget(main_dir: Path, family_key: str, column_name: str) -> str:
+    safe_main_dir = str(main_dir).replace(":", "_").replace("\\", "_").replace("/", "_").replace(" ", "_")
+    safe_column = str(column_name).replace(".", "_").replace(" ", "_")
+    safe_family = str(family_key).replace(" ", "_")
+    return f"indicator-requirement-{safe_main_dir}-{safe_family}-{safe_column}"
 
 
 def browse_for_folder(current_path: str) -> str | None:
@@ -588,23 +881,13 @@ def build_upload_signature(uploaded_files: list[Any]) -> tuple[tuple[str, int], 
 
 
 def normalize_processed_input_df(raw_df: pd.DataFrame) -> pd.DataFrame:
-    required = ["Date", "Time", "Open", "High", "Low", "Close", "EMA"]
-    safe_df = raw_df.copy()
-    safe_df.columns = safe_df.columns.str.strip()
-    missing = [column for column in required if column not in safe_df.columns]
-    if missing:
-        raise ValueError(f"Missing required processed-input columns: {', '.join(missing)}")
-
-    safe_df = safe_df.loc[:, required].copy()
-    safe_df["Date"] = safe_df["Date"].astype(str).str.strip()
-    safe_df["Time"] = safe_df["Time"].map(normalize_time)
-    numeric_columns = ["Open", "High", "Low", "Close", "EMA"]
-    safe_df[numeric_columns] = safe_df[numeric_columns].apply(pd.to_numeric, errors="coerce")
+    safe_df = normalize_input_data_df(raw_df)
+    if safe_df.empty:
+        return safe_df
+    safe_df = safe_df.copy()
     safe_df["DateObj"] = pd.to_datetime(safe_df["Date"], format="%d-%b-%y", errors="coerce")
-    safe_df = safe_df.dropna(subset=["DateObj", "Time", *numeric_columns])
-    safe_df = safe_df.sort_values(["DateObj", "Time"], kind="stable")
-    safe_df = safe_df.drop_duplicates(subset=["Date", "Time"], keep="last").reset_index(drop=True)
-    return safe_df
+    safe_df = safe_df.dropna(subset=["DateObj"]).sort_values(["DateObj", "Time"], kind="stable")
+    return safe_df.reset_index(drop=True)
 
 
 def build_trade_table_download_bytes(
@@ -644,150 +927,6 @@ def build_trade_table_download_bytes(
     return export_df.to_csv(index=False).encode("utf-8")
 
 
-def update_trade_data_in_google_drive(
-    drive_status: Any,
-    symbol: str,
-    trade_data_bytes: bytes | None,
-) -> tuple[str, str, dict[str, Any] | None]:
-    if trade_data_bytes is None:
-        return "warning", f"No trade data is available to update for {display_symbol(symbol)}.", None
-    if not getattr(drive_status, "connected", False) or getattr(drive_status, "output_folder", None) is None:
-        return "error", "Google Drive Output Files are not connected yet.", None
-
-    file_name = f"{symbol}.csv"
-    list_google_drive_folder_files.clear()
-    existing_drive_files = {
-        file_info.name.casefold()
-        for file_info in filter_supported_google_drive_files(
-            list_google_drive_folder_files(drive_status.output_folder.folder_id)
-        )
-    }
-    if file_name.casefold() not in existing_drive_files:
-        return (
-            "warning",
-            f"{display_symbol(symbol)} does not exist yet in Google Drive Output Files. Download it below and add it manually.",
-            {
-                "file_name": file_name,
-                "data": trade_data_bytes,
-                "mime": "text/csv",
-            },
-        )
-
-    last_error: Exception | None = None
-    for attempt in range(3):
-        try:
-            upload_google_drive_file(
-                folder_id=drive_status.output_folder.folder_id,
-                file_name=file_name,
-                content=trade_data_bytes,
-                mime_type="text/csv",
-            )
-            list_google_drive_folder_files.clear()
-            return "success", f"Updated Google Drive Output Files for {display_symbol(symbol)}.", None
-        except Exception as exc:
-            last_error = exc
-            error_text = str(exc)
-            retryable_error = any(
-                token in error_text
-                for token in (
-                    "SSL:",
-                    "RECORD_LAYER_FAILURE",
-                    "Connection reset",
-                    "EOF occurred",
-                    "timed out",
-                    "Timeout",
-                    "temporarily unavailable",
-                )
-            )
-            if retryable_error and attempt < 2:
-                time.sleep(1.2 * (attempt + 1))
-                continue
-            break
-
-    return "error", f"Could not update Google Drive Output Files for {display_symbol(symbol)}: {last_error}", None
-
-
-@st.dialog("Process Drive Raw Files", width="large")
-def render_drive_process_dialog(
-    symbol_names: list[str],
-    symbol_files: dict[str, list[Any]],
-    main_dir: Path,
-    drive_input_folder_id: str,
-) -> None:
-    try:
-        st.caption("Select one or more scrips from Google Drive Raw Files to process into Input Files.")
-        st.multiselect(
-            "Select Drive Scrips to Process",
-            symbol_names,
-            key="drive_selected_symbols",
-            format_func=display_symbol,
-            help="Only the selected scrips will be processed from Google Drive Raw Files.",
-        )
-
-        feedback_level = st.session_state.get("drive_dialog_feedback_level")
-        feedback_message = str(st.session_state.get("drive_dialog_feedback_message") or "").strip()
-        if feedback_level and feedback_message:
-            feedback_fn = {
-                "success": st.success,
-                "warning": st.warning,
-                "error": st.error,
-            }.get(feedback_level, st.info)
-            feedback_fn(feedback_message)
-
-        manual_downloads = st.session_state.get("drive_manual_input_downloads") or []
-        if manual_downloads:
-            st.markdown("**Manual Input File Downloads**")
-            st.caption("These processed CSV files could not be created automatically in Google Drive. Download them and add them manually to Drive Input Files.")
-            for item in manual_downloads:
-                file_name = str(item.get("file_name") or "processed_input.csv")
-                file_bytes = item.get("data") or b""
-                mime_type = str(item.get("mime") or "text/csv")
-                st.download_button(
-                    f"Download {file_name}",
-                    data=file_bytes,
-                    file_name=file_name,
-                    mime=mime_type,
-                    width="stretch",
-                    key=f"drive-dialog-download-{file_name}",
-                )
-
-        process_col, cancel_col = st.columns(2, gap="small")
-        with process_col:
-            if st.button("Process Selected Drive Scrips", width="stretch"):
-                _, input_dir, output_dir = ensure_workspace_dirs(main_dir)
-                try:
-                    level, message, manual_downloads = process_selected_drive_raw_symbols(
-                        selected_symbols=list(st.session_state.get("drive_selected_symbols", [])),
-                        symbol_files=symbol_files,
-                        input_dir=input_dir,
-                        drive_input_folder_id=drive_input_folder_id,
-                    )
-                except Exception as exc:
-                    level, message, manual_downloads = "error", f"Google Drive processing failed: {exc}", []
-                st.session_state.drive_dialog_feedback_level = level
-                st.session_state.drive_dialog_feedback_message = message
-                st.session_state.drive_manual_input_downloads = manual_downloads
-                st.session_state.main_dir_path_input = str(main_dir)
-                st.session_state.data_dir_path_input = str(input_dir)
-                st.session_state.output_dir_path_input = str(output_dir)
-                st.session_state.selected_symbol_restore = None
-                list_google_drive_folder_files.clear()
-                list_symbols.clear()
-                load_data.clear()
-                st.rerun()
-        with cancel_col:
-            if st.button("Cancel", width="stretch"):
-                st.session_state.drive_dialog_feedback_level = None
-                st.session_state.drive_dialog_feedback_message = ""
-                st.session_state.drive_manual_input_downloads = []
-                st.session_state.show_drive_process_dialog = False
-                st.rerun()
-    except Exception as exc:
-        st.error(f"Drive processing dialog error: {exc}")
-        with st.expander("Show full error details", expanded=True):
-            st.code(traceback.format_exc(), language="python")
-
-
 def build_processing_feedback(summary) -> tuple[str, str]:
     parts: list[str] = []
     if summary.processed:
@@ -813,199 +952,40 @@ def build_processing_feedback(summary) -> tuple[str, str]:
     return level, message
 
 
-def process_selected_drive_raw_symbols(
-    selected_symbols: list[str],
-    symbol_files: dict[str, list[Any]],
-    input_dir: Path,
-    drive_input_folder_id: str,
-) -> tuple[str, str, list[dict[str, Any]]]:
-    if not str(drive_input_folder_id or "").strip():
-        return "error", "Google Drive Input Files folder is not available.", []
-    if not selected_symbols:
-        return "warning", "Please select at least one scrip to process.", []
-
-    missing_symbols = [symbol for symbol in selected_symbols if symbol not in symbol_files]
-    if missing_symbols:
-        joined = ", ".join(sorted(missing_symbols))
-        return "error", f"Selected scrips were not found in Google Drive Raw Files: {joined}", []
-
-    temp_root = Path(tempfile.mkdtemp(prefix="ema_drive_process_"))
-    temp_raw_dir = temp_root / "Raw Files"
-    temp_input_dir = temp_root / "Input Files"
-    temp_raw_dir.mkdir(parents=True, exist_ok=True)
-    temp_input_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        drive_input_files = {
-            file_info.name.casefold(): file_info
-            for file_info in filter_supported_google_drive_files(
-                list_google_drive_folder_files(drive_input_folder_id)
-            )
-        }
-        selected_files: list[Any] = []
-        for symbol in selected_symbols:
-            selected_files.extend(symbol_files.get(symbol, []))
-
-        download_google_drive_files_to_dir(selected_files, temp_raw_dir)
-        summary = process_raw_folder(temp_raw_dir, temp_input_dir)
-        missing_drive_targets: list[str] = []
-        manual_downloads: list[dict[str, Any]] = []
-        uploaded_drive_targets: list[str] = []
-
-        for symbol in selected_symbols:
-            processed_csv_path = temp_input_dir / f"{symbol}.csv"
-            if not processed_csv_path.exists():
-                continue
-            target_csv_path = csv_path_for_stem(input_dir, symbol)
-            target_csv_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(processed_csv_path, target_csv_path)
-            remove_other_matching_data_files(input_dir, symbol, target_csv_path)
-            drive_file_name = target_csv_path.name
-            if drive_file_name.casefold() not in drive_input_files:
-                missing_drive_targets.append(drive_file_name)
-                manual_downloads.append(
-                    {
-                        "file_name": drive_file_name,
-                        "data": processed_csv_path.read_bytes(),
-                        "mime": "text/csv",
-                    }
-                )
-                continue
-            upload_google_drive_file(
-                folder_id=drive_input_folder_id,
-                file_name=drive_file_name,
-                content=processed_csv_path.read_bytes(),
-                mime_type="text/csv",
-            )
-            uploaded_drive_targets.append(drive_file_name)
-
-        level, message = build_processing_feedback(summary)
-        if uploaded_drive_targets:
-            uploaded_preview = ", ".join(uploaded_drive_targets[:5])
-            extra_uploaded = max(0, len(uploaded_drive_targets) - 5)
-            uploaded_suffix = f" (+{extra_uploaded} more)" if extra_uploaded else ""
-            message = f"{message}. Updated in Google Drive Input Files: {uploaded_preview}{uploaded_suffix}"
-        if missing_drive_targets:
-            missing_preview = ", ".join(missing_drive_targets[:5])
-            extra_missing = max(0, len(missing_drive_targets) - 5)
-            missing_suffix = f" (+{extra_missing} more)" if extra_missing else ""
-            message = (
-                f"{message}. Could not create new files in Google Drive Input Files: "
-                f"{missing_preview}{missing_suffix}. "
-                "Download these files below and add them manually, or pre-create them in My Drive, or move the folder to a Shared Drive."
-            )
-            if level == "success":
-                level = "warning"
-        return level, message, manual_downloads
-    finally:
-        shutil.rmtree(temp_root, ignore_errors=True)
-
-
-def sync_google_drive_input_files_to_dir(
-    drive_status: Any,
-    target_dir: Path,
-) -> tuple[str, str, int]:
-    if not getattr(drive_status, "connected", False) or getattr(drive_status, "input_folder", None) is None:
-        return "warning", "Google Drive Input Files are not connected yet.", 0
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        drive_input_files = filter_supported_google_drive_files(
-            list_google_drive_folder_files(drive_status.input_folder.folder_id)
-        )
-    except Exception as exc:
-        return "error", f"Could not read Google Drive Input Files: {exc}", 0
-
-    if not drive_input_files:
-        clear_supported_data_files(target_dir)
-        return "warning", "No supported files were found in Google Drive Input Files.", 0
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="ema_drive_input_sync_"))
-    try:
-        download_google_drive_files_to_dir(drive_input_files, temp_dir)
-        clear_supported_data_files(target_dir)
-        for downloaded_path in list_supported_data_files(temp_dir):
-            target_path = target_dir / downloaded_path.name
-            target_path.write_bytes(downloaded_path.read_bytes())
-        return "success", f"Loaded {len(drive_input_files)} input file(s) from Google Drive.", len(drive_input_files)
-    except Exception as exc:
-        return "error", f"Could not sync Google Drive Input Files: {exc}", 0
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def sync_google_drive_output_files_to_dir(
-    drive_status: Any,
-    target_dir: Path,
-) -> tuple[str, str, int]:
-    if not getattr(drive_status, "connected", False) or getattr(drive_status, "output_folder", None) is None:
-        return "warning", "Google Drive Output Files are not connected yet.", 0
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        drive_output_files = filter_supported_google_drive_files(
-            list_google_drive_folder_files(drive_status.output_folder.folder_id)
-        )
-    except Exception as exc:
-        return "error", f"Could not read Google Drive Output Files: {exc}", 0
-
-    if not drive_output_files:
-        clear_supported_data_files(target_dir)
-        return "success", "No saved output files were found in Google Drive Output Files.", 0
-
-    temp_dir = Path(tempfile.mkdtemp(prefix="ema_drive_output_sync_"))
-    try:
-        download_google_drive_files_to_dir(drive_output_files, temp_dir)
-        clear_supported_data_files(target_dir)
-        for downloaded_path in list_supported_data_files(temp_dir):
-            target_path = target_dir / downloaded_path.name
-            target_path.write_bytes(downloaded_path.read_bytes())
-        return "success", f"Loaded {len(drive_output_files)} output file(s) from Google Drive.", len(drive_output_files)
-    except Exception as exc:
-        return "error", f"Could not sync Google Drive Output Files: {exc}", 0
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def reload_selected_drive_output_for_symbol(
-    drive_status: Any,
-    symbol: str,
-    output_dir: Path,
-    input_df: pd.DataFrame,
-) -> tuple[str, str, list[dict[str, Any]] | None]:
-    if not getattr(drive_status, "connected", False) or getattr(drive_status, "output_folder", None) is None:
-        return "error", "Google Drive Output Files are not connected yet.", None
-
-    list_google_drive_folder_files.clear()
-    drive_output_files = filter_supported_google_drive_files(
-        list_google_drive_folder_files(drive_status.output_folder.folder_id)
-    )
-    matching_file = next(
-        (
-            file_info
-            for file_info in drive_output_files
-            if Path(file_info.name).stem.casefold() == symbol.casefold()
-        ),
-        None,
-    )
-    if matching_file is None:
-        return "warning", f"No Google Drive Output file exists yet for {display_symbol(symbol)}.", None
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    target_csv_path = csv_path_for_stem(output_dir, symbol)
-    downloaded_paths = download_google_drive_files_to_dir([matching_file], output_dir)
-    downloaded_path = Path(downloaded_paths[0]) if downloaded_paths else target_csv_path
-    if downloaded_path != target_csv_path and downloaded_path.exists():
-        target_csv_path.write_bytes(downloaded_path.read_bytes())
+def build_auto_process_signature(raw_dir: Path) -> tuple[str, tuple[tuple[str, int, int], ...]]:
+    file_states: list[tuple[str, int, int]] = []
+    for file_path in list_supported_data_files(raw_dir):
         try:
-            downloaded_path.unlink()
+            stat = file_path.stat()
+            file_states.append((file_path.name.casefold(), int(stat.st_size), int(stat.st_mtime_ns)))
         except OSError:
-            pass
-    remove_other_matching_data_files(output_dir, symbol, target_csv_path)
+            file_states.append((file_path.name.casefold(), -1, -1))
+    return (str(raw_dir.resolve()), tuple(file_states))
 
-    loaded_saved_signals = load_saved_signals_file(target_csv_path, symbol, input_df=input_df)
-    persisted_saved_signals = persist_saved_signals_file(target_csv_path, symbol, loaded_saved_signals)
-    return "success", f"Reloaded Google Drive Output data for {display_symbol(symbol)}.", persisted_saved_signals
+
+def auto_process_input_files_if_needed(
+    main_dir: Path,
+    raw_dir: Path,
+    input_dir: Path,
+    indicator_labels: dict[str, str] | None = None,
+) -> bool:
+    signature = build_auto_process_signature(raw_dir)
+    if st.session_state.get("auto_process_signature") == signature:
+        return False
+
+    with st.spinner(f"Processing input files in {main_dir.name}..."):
+        summary = process_raw_folder(raw_dir, input_dir, indicator_labels=indicator_labels)
+
+    level, message = build_processing_feedback(summary)
+    st.session_state.process_feedback_level = level
+    st.session_state.process_feedback_message = message
+    st.session_state.auto_process_signature = signature
+    st.session_state.data_dir_path_input = str(input_dir)
+    st.session_state.selected_symbol_restore = st.session_state.get("selected_symbol")
+    list_symbols.clear()
+    list_instruments.clear()
+    load_data.clear()
+    return True
 
 
 def build_saved_signal_timestamp(date_value: Any, time_value: Any) -> pd.Timestamp:
@@ -1028,14 +1008,32 @@ def output_signal_csv_path(output_dir: Path, symbol: str) -> Path:
     return csv_path_for_stem(output_dir, symbol)
 
 
+def resolve_signal_storage_stem(symbol: str, timeframe_options: list[str], instrument_key: str) -> str:
+    if len(set(str(item) for item in timeframe_options if str(item).strip())) > 1:
+        return instrument_key
+    return str(symbol or "").capitalize()
+
+
 def ensure_output_signal_file(output_dir: Path, symbol: str) -> Path:
     csv_path = output_signal_csv_path(output_dir, symbol)
     existing_path = find_data_file_by_stem(output_dir, symbol)
+    parsed_identity = parse_instrument_identity(symbol)
+    legacy_symbol_path = find_data_file_by_stem(output_dir, parsed_identity.symbol.capitalize())
     if existing_path and existing_path.exists() and existing_path != csv_path:
         raw_df = read_tabular_file(existing_path)
         normalized_df = normalize_saved_signals_df(raw_df, symbol)
         write_tabular_file(normalized_df, csv_path)
         remove_other_matching_data_files(output_dir, symbol, csv_path)
+    elif (
+        legacy_symbol_path
+        and legacy_symbol_path.exists()
+        and legacy_symbol_path != csv_path
+        and "__" in str(symbol)
+        and not csv_path.exists()
+    ):
+        raw_df = read_tabular_file(legacy_symbol_path)
+        normalized_df = normalize_saved_signals_df(raw_df, parsed_identity.symbol.upper())
+        write_tabular_file(normalized_df, csv_path)
     elif not csv_path.exists():
         write_tabular_file(empty_saved_signals_df(), csv_path)
     return csv_path
@@ -1056,7 +1054,7 @@ def normalize_saved_signals_df(raw_df: pd.DataFrame, symbol: str) -> pd.DataFram
     distinct_symbols = {value for value in safe_df["Symbol"] if value and value.lower() != "nan"}
     if not distinct_symbols:
         safe_df["Symbol"] = symbol
-    elif distinct_symbols != {symbol}:
+    elif {value.casefold() for value in distinct_symbols} != {str(symbol).casefold()}:
         found_symbols = ", ".join(sorted(distinct_symbols))
         raise ValueError(f"Saved-signal file symbols ({found_symbols}) do not match selected scrip {symbol}.")
 
@@ -1199,6 +1197,299 @@ def persist_saved_signals_file(csv_path: Path, symbol: str, saved_signals: list[
     return normalized_df.to_dict("records")
 
 
+def cleanup_workspace_output_files(output_dir: Path, instruments: list[dict[str, str]]) -> tuple[str | None, str]:
+    if not output_dir.exists() or not output_dir.is_dir() or not instruments:
+        return None, ""
+
+    actions: list[str] = []
+    warnings: list[str] = []
+    instruments_by_symbol: dict[str, list[dict[str, str]]] = {}
+    for item in instruments:
+        symbol = str(item.get("symbol") or "").strip()
+        if symbol:
+            instruments_by_symbol.setdefault(symbol, []).append(item)
+
+    for symbol, symbol_items in sorted(instruments_by_symbol.items()):
+        timeframe_options = [str(item.get("timeframe_label") or "") for item in symbol_items]
+        expected_simple_stem = str(symbol).capitalize()
+        expected_simple_path = output_signal_csv_path(output_dir, expected_simple_stem)
+
+        if len(set(option for option in timeframe_options if option)) <= 1:
+            existing_simple_path = find_data_file_by_stem(output_dir, expected_simple_stem)
+            if existing_simple_path and existing_simple_path.exists() and existing_simple_path.name != expected_simple_path.name:
+                rename_file_preserving_case(existing_simple_path, expected_simple_path)
+                actions.append(f"Renamed {existing_simple_path.name} -> {expected_simple_path.name}")
+
+            merged_records: list[dict[str, Any]] | None = None
+            for item in symbol_items:
+                composite_stem = str(item.get("key") or "").strip()
+                if not composite_stem or composite_stem.casefold() == expected_simple_stem.casefold():
+                    continue
+                composite_path = find_data_file_by_stem(output_dir, composite_stem)
+                if not composite_path or not composite_path.exists():
+                    continue
+                try:
+                    if merged_records is None:
+                        merged_records = load_saved_signals_file(expected_simple_path, symbol) if expected_simple_path.exists() else []
+                    merged_records = [*merged_records, *load_saved_signals_file(composite_path, symbol)]
+                    persist_saved_signals_file(expected_simple_path, symbol, merged_records)
+                    composite_path.unlink()
+                    actions.append(f"Merged {composite_path.name} into {expected_simple_path.name}")
+                except Exception as exc:
+                    warnings.append(f"Skipped {composite_path.name}: {exc}")
+            continue
+
+        legacy_path = find_data_file_by_stem(output_dir, expected_simple_stem)
+        if legacy_path and legacy_path.exists():
+            try:
+                raw_df = read_tabular_file(legacy_path)
+            except Exception as exc:
+                warnings.append(f"Could not review {legacy_path.name}: {exc}")
+            else:
+                if not raw_df.empty:
+                    warnings.append(
+                        f"Left {legacy_path.name} in place because {display_symbol(symbol)} has multiple timeframes and the file has data."
+                    )
+                else:
+                    try:
+                        legacy_path.unlink()
+                        actions.append(f"Removed empty legacy file {legacy_path.name}")
+                    except OSError as exc:
+                        warnings.append(f"Could not remove {legacy_path.name}: {exc}")
+
+    message_parts: list[str] = []
+    level: str | None = None
+    if actions:
+        level = "info"
+        message_parts.append("Cleanup: " + "; ".join(actions))
+    if warnings:
+        level = "warning"
+        message_parts.append("Review: " + "; ".join(warnings))
+    return level, " ".join(part for part in message_parts if part).strip()
+
+
+INPUT_BASE_COLUMNS = ["Date", "Time", "Open", "High", "Low", "Close"]
+
+
+def get_input_indicator_columns(raw_df: pd.DataFrame) -> list[str]:
+    return [
+        str(column).strip()
+        for column in raw_df.columns
+        if str(column).strip()
+        and str(column).strip() not in INPUT_BASE_COLUMNS
+        and str(column).strip() not in {"TimeMinutes", "Timestamp", "Signal", "DateLabel", "TimeLabel", "TimeChart", "TimeEpoch", "SignalKey"}
+        and not str(column).strip().lower().startswith("unnamed:")
+    ]
+
+
+def ensure_primary_ema_alias(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, str | None]:
+    safe_df = raw_df.copy()
+    indicator_columns = [column for column in get_input_indicator_columns(safe_df) if column != "EMA"]
+    primary_ema_column = select_primary_ema_column(indicator_columns)
+    if "EMA" not in safe_df.columns and primary_ema_column and primary_ema_column in safe_df.columns:
+        safe_df["EMA"] = safe_df[primary_ema_column]
+    elif "EMA" not in safe_df.columns and primary_ema_column is None:
+        safe_df["EMA"] = safe_df["Close"] if "Close" in safe_df.columns else pd.NA
+    return safe_df, primary_ema_column or ("EMA" if "EMA" in safe_df.columns else None)
+
+
+def build_indicator_groups(raw_df: pd.DataFrame) -> list[dict[str, Any]]:
+    indicator_columns = [column for column in get_input_indicator_columns(raw_df) if column != "EMA"]
+    groups: list[dict[str, Any]] = []
+    super_trend_columns = [
+        column
+        for column in indicator_columns
+        if normalize_indicator_family(column) == "super trend"
+    ]
+    if super_trend_columns:
+        groups.append(
+            {
+                "key": "super-trend",
+                "default_name": "SuperTrend",
+                "name": "SuperTrend",
+                "columns": super_trend_columns,
+            }
+        )
+
+    used_columns = set(super_trend_columns)
+    for column in indicator_columns:
+        if column in used_columns:
+            continue
+        groups.append(
+            {
+                "key": str(column),
+                "default_name": str(column),
+                "name": str(column),
+                "columns": [column],
+            }
+        )
+
+    if not groups and "EMA" in raw_df.columns:
+        groups.append({"key": "ema", "default_name": "EMA", "name": "EMA", "columns": ["EMA"]})
+    return groups
+
+
+def apply_indicator_display_names(
+    groups: list[dict[str, Any]],
+    indicator_display_name_config: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    indicator_display_name_config = indicator_display_name_config or {}
+    resolved_groups: list[dict[str, Any]] = []
+    for group in groups:
+        resolved_group = dict(group)
+        group_key = str(resolved_group.get("key") or "")
+        default_name = str(resolved_group.get("default_name") or resolved_group.get("name") or group_key)
+        display_name = str(indicator_display_name_config.get(group_key) or "").strip() or default_name
+        resolved_group["default_name"] = default_name
+        resolved_group["name"] = display_name
+        resolved_groups.append(resolved_group)
+    return resolved_groups
+
+
+def indicator_color_setting_keys(group: dict[str, Any]) -> list[str]:
+    group_key = str(group.get("key") or group.get("name") or "")
+    if group_key == "super-trend":
+        return ["Super Trend Bull", "Super Trend Bear"]
+    return [group_key]
+
+
+def default_indicator_colors(group: dict[str, Any]) -> dict[str, str]:
+    group_key = str(group.get("key") or group.get("name") or "")
+    group_name = str(group.get("default_name") or group.get("name") or group_key)
+    if group_key == "super-trend":
+        return {
+            "Super Trend Bull": BUY_COLOR,
+            "Super Trend Bear": SELL_COLOR,
+        }
+    family = normalize_indicator_family(group_name)
+    if family.startswith("ema"):
+        palette = {
+            "ema 100": "#0ea5e9",
+            "ema 200": "#2962ff",
+        }
+        return {group_key: palette.get(family, "#2962ff")}
+    return {group_key: "#0f766e"}
+
+
+def indicator_color_labels(group: dict[str, Any]) -> dict[str, str]:
+    group_name = str(group.get("name") or group.get("default_name") or group.get("key") or "Indicator")
+    if str(group.get("key") or "") == "super-trend":
+        return {
+            "Super Trend Bull": f"{group_name} Bull Color",
+            "Super Trend Bear": f"{group_name} Bear Color",
+        }
+    group_key = str(group.get("key") or group_name)
+    return {group_key: f"{group_name} Color"}
+
+
+def normalize_input_data_df(raw_df: pd.DataFrame) -> pd.DataFrame:
+    if raw_df.empty:
+        return pd.DataFrame(columns=[*INPUT_BASE_COLUMNS, "EMA"])
+
+    safe_df = raw_df.copy()
+    safe_df.columns = safe_df.columns.str.strip()
+    required = [*INPUT_BASE_COLUMNS]
+    missing = [column for column in required if column not in safe_df.columns]
+    if missing:
+        raise ValueError(f"Missing required input columns: {', '.join(missing)}")
+
+    safe_df, primary_ema_column = ensure_primary_ema_alias(safe_df)
+    indicator_columns = get_input_indicator_columns(safe_df)
+    ordered_columns = [*INPUT_BASE_COLUMNS]
+    if "EMA" in safe_df.columns:
+        ordered_columns.append("EMA")
+    ordered_columns.extend(
+        column
+        for column in indicator_columns
+        if column not in ordered_columns
+    )
+    safe_df = safe_df.loc[:, [column for column in ordered_columns if column in safe_df.columns]].copy()
+    safe_df["Date"] = pd.to_datetime(safe_df["Date"], format="%d-%b-%y", errors="coerce")
+    safe_df["Time"] = safe_df["Time"].map(normalize_time)
+    safe_df["Timestamp"] = pd.to_datetime(
+        safe_df["Date"].dt.strftime("%Y-%m-%d") + " " + safe_df["Time"].str.replace(".", ":", regex=False),
+        format="%Y-%m-%d %H:%M",
+        errors="coerce",
+    )
+    numeric_columns = [column for column in ordered_columns if column not in {"Date", "Time"}]
+    safe_df[numeric_columns] = safe_df[numeric_columns].apply(pd.to_numeric, errors="coerce")
+    safe_df = safe_df.dropna(subset=["Timestamp", "Open", "High", "Low", "Close"]).copy()
+    if safe_df.empty:
+        return pd.DataFrame(columns=ordered_columns)
+
+    safe_df["Date"] = safe_df["Timestamp"].dt.strftime("%d-%b-%y")
+    safe_df["Time"] = safe_df["Timestamp"].dt.strftime("%H.%M")
+    safe_df = safe_df.drop_duplicates(subset=["Date", "Time"], keep="last")
+    safe_df = safe_df.sort_values("Timestamp", kind="stable").reset_index(drop=True)
+    return safe_df.loc[:, ordered_columns]
+
+
+def sync_saved_signals_to_drive(
+    local_csv_path: Path,
+    drive_output_dir: Path,
+    symbol: str,
+    storage_stem: str,
+    input_df: pd.DataFrame | None = None,
+) -> tuple[Path, list[dict[str, Any]], int]:
+    local_signals = load_saved_signals_file(local_csv_path, symbol, input_df=input_df)
+    drive_csv_path = output_signal_csv_path(drive_output_dir, storage_stem)
+    drive_signals = load_saved_signals_file(drive_csv_path, symbol, input_df=input_df) if drive_csv_path.exists() else []
+
+    merged_records = [*drive_signals, *local_signals]
+    merged_df = (
+        normalize_saved_signals_df(pd.DataFrame(merged_records), symbol)
+        if merged_records
+        else empty_saved_signals_df()
+    )
+    write_tabular_file(merged_df, drive_csv_path)
+    write_tabular_file(merged_df, local_csv_path)
+    merged_signals = merged_df.to_dict("records")
+    return drive_csv_path, merged_signals, int(len(merged_df))
+
+
+def sync_input_file_to_drive(local_input_dir: Path, drive_input_dir: Path, storage_stem: str) -> tuple[Path | None, int]:
+    local_input_path = find_data_file_by_stem(local_input_dir, storage_stem)
+    if not local_input_path or not local_input_path.exists():
+        return None, 0
+
+    local_df = normalize_input_data_df(read_tabular_file(local_input_path))
+    drive_input_path = csv_path_for_stem(drive_input_dir, storage_stem)
+    drive_df = (
+        normalize_input_data_df(read_tabular_file(drive_input_path))
+        if drive_input_path.exists()
+        else pd.DataFrame(columns=local_df.columns)
+    )
+    merged_df = normalize_input_data_df(pd.concat([drive_df, local_df], ignore_index=True))
+    write_tabular_file(merged_df, drive_input_path)
+    write_tabular_file(merged_df, local_input_path)
+    return drive_input_path, int(len(merged_df))
+
+
+def sync_raw_files_to_drive(local_raw_dir: Path, drive_raw_dir: Path, instrument_identity: InstrumentIdentity) -> int:
+    copied_count = 0
+    drive_raw_dir.mkdir(parents=True, exist_ok=True)
+    for file_path in list_supported_data_files(local_raw_dir):
+        file_identity = parse_instrument_identity(file_path.name)
+        if (
+            file_identity.exchange.upper() != instrument_identity.exchange.upper()
+            or file_identity.symbol.upper() != instrument_identity.symbol.upper()
+            or file_identity.timeframe_label != instrument_identity.timeframe_label
+        ):
+            continue
+        shutil.copy2(file_path, drive_raw_dir / file_path.name)
+        copied_count += 1
+    for file_path in list_supported_data_files(drive_raw_dir):
+        file_identity = parse_instrument_identity(file_path.name)
+        if (
+            file_identity.exchange.upper() != instrument_identity.exchange.upper()
+            or file_identity.symbol.upper() != instrument_identity.symbol.upper()
+            or file_identity.timeframe_label != instrument_identity.timeframe_label
+        ):
+            continue
+        shutil.copy2(file_path, local_raw_dir / file_path.name)
+    return copied_count
+
+
 def apply_saved_signals_state(saved_signals: list[dict[str, Any]], symbol: str, output_csv_path: Path) -> None:
     st.session_state.saved_signals = saved_signals
     st.session_state.saved_signals_symbol = symbol
@@ -1213,29 +1504,35 @@ def load_data(csv_path: str) -> pd.DataFrame:
     df = read_tabular_file(Path(csv_path))
     df.columns = df.columns.str.strip()
 
-    required = ["Date", "Time", "Open", "High", "Low", "Close", "EMA"]
+    required = [*INPUT_BASE_COLUMNS]
     missing = [column for column in required if column not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {', '.join(missing)}")
 
-    df = df.loc[:, required].copy()
+    df, primary_ema_column = ensure_primary_ema_alias(df)
+    indicator_columns = get_input_indicator_columns(df)
+    ordered_columns = [*INPUT_BASE_COLUMNS]
+    if "EMA" in df.columns:
+        ordered_columns.append("EMA")
+    ordered_columns.extend(
+        column
+        for column in indicator_columns
+        if column not in ordered_columns
+    )
+    df = df.loc[:, [column for column in ordered_columns if column in df.columns]].copy()
     df["Date"] = pd.to_datetime(df["Date"], format="%d-%b-%y", errors="coerce")
     df["Time"] = df["Time"].map(normalize_time)
-    df["TimeMinutes"] = df["Time"].map(time_to_minutes)
     df["Timestamp"] = pd.to_datetime(
         df["Date"].dt.strftime("%Y-%m-%d") + " " + df["Time"].str.replace(".", ":", regex=False),
         format="%Y-%m-%d %H:%M",
         errors="coerce",
     )
 
-    numeric_columns = ["Open", "High", "Low", "Close", "EMA"]
+    numeric_columns = [column for column in ordered_columns if column not in {"Date", "Time"}]
     df[numeric_columns] = df[numeric_columns].apply(pd.to_numeric, errors="coerce")
 
-    df = df.dropna(subset=["Date", "Timestamp", *numeric_columns])
-    df = df.loc[
-        (df["TimeMinutes"] >= SESSION_START_MINUTES)
-        & (df["TimeMinutes"] <= SESSION_END_MINUTES)
-    ].sort_values("Timestamp", kind="stable")
+    df = df.dropna(subset=["Date", "Timestamp", "Open", "High", "Low", "Close"])
+    df = df.sort_values("Timestamp", kind="stable")
 
     df["Signal"] = df["Close"].ge(df["Open"]).map({True: "BUY", False: "SELL"})
     df["DateLabel"] = df["Timestamp"].dt.strftime("%d-%b-%y")
@@ -1267,28 +1564,7 @@ def prepare_candle_data(df: pd.DataFrame, from_date: Any, to_date: Any) -> tuple
     ]
     was_limited = len(filtered_df) > MAX_CANDLES
     if was_limited:
-        filtered_df = filtered_df.copy()
-        filtered_df["MonthPeriod"] = filtered_df["Timestamp"].dt.to_period("M")
-        month_frames: list[pd.DataFrame] = []
-        running_total = 0
-
-        for _, month_df in filtered_df.groupby("MonthPeriod", sort=True):
-            month_len = len(month_df)
-            if month_frames and running_total + month_len > MAX_CANDLES:
-                break
-            if not month_frames and month_len > MAX_CANDLES:
-                month_frames.append(month_df.head(MAX_CANDLES))
-                running_total = MAX_CANDLES
-                break
-            month_frames.append(month_df)
-            running_total += month_len
-
-        if month_frames:
-            filtered_df = pd.concat(month_frames, ignore_index=True)
-        else:
-            filtered_df = filtered_df.head(MAX_CANDLES)
-
-        filtered_df = filtered_df.drop(columns=["MonthPeriod"], errors="ignore")
+        filtered_df = filtered_df.head(MAX_CANDLES)
 
     filtered_df = filtered_df.reset_index(drop=True)
 
@@ -1327,6 +1603,231 @@ def prepare_ema_data(filtered_df: pd.DataFrame) -> list[dict[str, Any]]:
     )
 
 
+def prepare_indicator_series_data(
+    filtered_df: pd.DataFrame,
+    indicator_groups: list[dict[str, Any]] | None = None,
+    indicator_color_config: dict[str, str] | None = None,
+    indicator_line_width_config: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+    indicator_color_config = indicator_color_config or {}
+    indicator_line_width_config = indicator_line_width_config or {}
+    groups = indicator_groups or build_indicator_groups(filtered_df)
+    series_payload: list[dict[str, Any]] = []
+    for group in groups:
+        group_key = str(group.get("key") or group.get("name") or "")
+        group_name = str(group.get("name") or "")
+        columns = [column for column in group.get("columns", []) if column in filtered_df.columns]
+        default_colors = default_indicator_colors(group)
+        resolved_line_width = max(
+            1,
+            min(
+                4,
+                int(
+                    indicator_line_width_config.get(
+                        group_key,
+                        INDICATOR_LINE_WIDTH_OPTIONS["medium"],
+                    )
+                    or INDICATOR_LINE_WIDTH_OPTIONS["medium"]
+                ),
+            ),
+        )
+        resolved_colors = {
+            key: indicator_color_config.get(key, default_value)
+            for key, default_value in default_colors.items()
+        }
+        if normalize_indicator_family(group_name) == "super trend" and columns:
+            super_trend_df = filtered_df.loc[:, ["TimeEpoch", "Close", *columns]].copy()
+            for column_name in columns:
+                super_trend_df[column_name] = pd.to_numeric(super_trend_df[column_name], errors="coerce")
+            normalized_columns = {
+                column_name: re.sub(r"[\s_\-]+", " ", str(column_name).strip()).lower()
+                for column_name in columns
+            }
+            bull_columns = [
+                column_name
+                for column_name, normalized_name in normalized_columns.items()
+                if normalized_name in {"up trend", "super trend up", "supertrend up"}
+            ]
+            bear_columns = [
+                column_name
+                for column_name, normalized_name in normalized_columns.items()
+                if normalized_name in {"down trend", "super trend down", "supertrend down", "super trend dn", "supertrend dn"}
+            ]
+            if not bull_columns and not bear_columns and len(columns) == 1:
+                bull_columns = [columns[0]]
+                bear_columns = [columns[0]]
+            elif not bull_columns and columns:
+                bull_columns = [columns[0]]
+            elif not bear_columns and len(columns) > 1:
+                bear_columns = [columns[-1]]
+            if not bull_columns and not bear_columns:
+                continue
+            bull_segments: list[list[dict[str, Any]]] = []
+            bear_segments: list[list[dict[str, Any]]] = []
+            current_bull_segment: list[dict[str, Any]] = []
+            current_bear_segment: list[dict[str, Any]] = []
+            for row in super_trend_df.to_dict("records"):
+                time_value = int(row["TimeEpoch"])
+                close_value = float(row["Close"])
+                bull_value = next(
+                    (
+                        float(row[column_name])
+                        for column_name in bull_columns
+                        if pd.notna(row.get(column_name))
+                    ),
+                    None,
+                )
+                bear_value = next(
+                    (
+                        float(row[column_name])
+                        for column_name in bear_columns
+                        if pd.notna(row.get(column_name))
+                    ),
+                    None,
+                )
+                active_side = None
+                if bull_value is not None and close_value > bull_value:
+                    active_side = "bull"
+                elif bear_value is not None and close_value < bear_value:
+                    active_side = "bear"
+
+                if active_side == "bull":
+                    current_bull_segment.append({"time": time_value, "value": bull_value})
+                elif current_bull_segment:
+                    bull_segments.append(current_bull_segment)
+                    current_bull_segment = []
+
+                if active_side == "bear":
+                    current_bear_segment.append({"time": time_value, "value": bear_value})
+                elif current_bear_segment:
+                    bear_segments.append(current_bear_segment)
+                    current_bear_segment = []
+
+            if current_bull_segment:
+                bull_segments.append(current_bull_segment)
+            if current_bear_segment:
+                bear_segments.append(current_bear_segment)
+
+            for segment_index, bull_points in enumerate(bull_segments, start=1):
+                series_payload.append(
+                    {
+                        "id": f"{group_key}:bull:{segment_index}",
+                        "groupKey": group_key,
+                        "name": group_name,
+                        "column": "Super Trend Bull",
+                        "color": resolved_colors.get("Super Trend Bull", BUY_COLOR),
+                        "lineWidth": resolved_line_width,
+                        "data": bull_points,
+                    }
+                )
+            for segment_index, bear_points in enumerate(bear_segments, start=1):
+                series_payload.append(
+                    {
+                        "id": f"{group_key}:bear:{segment_index}",
+                        "groupKey": group_key,
+                        "name": group_name,
+                        "column": "Super Trend Bear",
+                        "color": resolved_colors.get("Super Trend Bear", SELL_COLOR),
+                        "lineWidth": resolved_line_width,
+                        "data": bear_points,
+                    }
+                )
+            continue
+        for index, column_name in enumerate(columns):
+            line_df = filtered_df.loc[:, ["TimeEpoch", column_name]].copy()
+            line_df[column_name] = pd.to_numeric(line_df[column_name], errors="coerce")
+            line_df = line_df.dropna(subset=[column_name])
+            if line_df.empty:
+                continue
+            series_payload.append(
+                {
+                    "id": f"{group_key}:{column_name}",
+                    "groupKey": group_key,
+                    "name": group_name,
+                    "column": column_name,
+                    "color": resolved_colors.get(group_key, list(default_colors.values())[0]),
+                    "lineWidth": resolved_line_width,
+                    "data": (
+                        line_df.rename(columns={"TimeEpoch": "time", column_name: "value"})
+                        .astype({"time": "int64", "value": "float64"})
+                        .to_dict("records")
+                    ),
+                }
+            )
+    return series_payload
+
+
+def build_chart_payload_signature(
+    data_file_path: Path,
+    from_date: Any,
+    to_date: Any,
+    indicator_color_config: dict[str, str] | None = None,
+    indicator_line_width_config: dict[str, int] | None = None,
+) -> tuple[str, int, int, str, str, int, str, str]:
+    try:
+        stat = data_file_path.stat()
+        size = int(stat.st_size)
+        mtime_ns = int(stat.st_mtime_ns)
+    except OSError:
+        size = -1
+        mtime_ns = -1
+    color_signature = json.dumps(dict(sorted((indicator_color_config or {}).items())), sort_keys=True)
+    width_signature = json.dumps(dict(sorted((indicator_line_width_config or {}).items())), sort_keys=True)
+    return (
+        str(data_file_path.resolve()),
+        size,
+        mtime_ns,
+        pd.Timestamp(from_date).date().isoformat(),
+        pd.Timestamp(to_date).date().isoformat(),
+        int(MAX_CANDLES),
+        color_signature,
+        width_signature,
+    )
+
+
+def get_chart_payload(
+    df: pd.DataFrame,
+    data_file_path: Path,
+    from_date: Any,
+    to_date: Any,
+    indicator_groups: list[dict[str, Any]] | None = None,
+    indicator_color_config: dict[str, str] | None = None,
+    indicator_line_width_config: dict[str, int] | None = None,
+) -> tuple[pd.DataFrame, list[dict[str, Any]], list[dict[str, Any]], bool]:
+    signature = build_chart_payload_signature(
+        data_file_path,
+        from_date,
+        to_date,
+        indicator_color_config,
+        indicator_line_width_config,
+    )
+    if st.session_state.get("chart_payload_signature") == signature:
+        cached_payload = st.session_state.get("chart_payload_data")
+        if isinstance(cached_payload, dict):
+            chart_df = cached_payload.get("chart_df")
+            candle_data = cached_payload.get("candle_data")
+            indicator_data = cached_payload.get("indicator_data")
+            was_limited = bool(cached_payload.get("was_limited"))
+            if isinstance(chart_df, pd.DataFrame) and isinstance(candle_data, list) and isinstance(indicator_data, list):
+                return chart_df, candle_data, indicator_data, was_limited
+
+    chart_df, candle_data, was_limited = prepare_candle_data(df, from_date, to_date)
+    indicator_data = prepare_indicator_series_data(
+        chart_df,
+        indicator_groups=indicator_groups,
+        indicator_color_config=indicator_color_config,
+        indicator_line_width_config=indicator_line_width_config,
+    )
+    st.session_state.chart_payload_signature = signature
+    st.session_state.chart_payload_data = {
+        "chart_df": chart_df,
+        "candle_data": candle_data,
+        "indicator_data": indicator_data,
+        "was_limited": was_limited,
+    }
+    return chart_df, candle_data, indicator_data, was_limited
+
+
 def build_signal_record(symbol: str, row: pd.Series) -> dict[str, Any]:
     signal = "BUY" if row["Close"] >= row["Open"] else "SELL"
     return {
@@ -1346,10 +1847,449 @@ def build_signal_record(symbol: str, row: pd.Series) -> dict[str, Any]:
     }
 
 
+def validate_signal_sequence(signal_record: dict[str, Any], saved_signals: list[dict[str, Any]]) -> str | None:
+    if not saved_signals:
+        return None
+
+    ordered_signals = sorted(
+        [*saved_signals, signal_record],
+        key=lambda item: (int(item["TimeEpoch"]), str(item["SignalKey"])),
+    )
+    current_index = next(
+        (
+            index
+            for index, item in enumerate(ordered_signals)
+            if str(item["SignalKey"]) == str(signal_record["SignalKey"])
+        ),
+        None,
+    )
+    if current_index is None:
+        return None
+
+    current_signal = str(signal_record.get("Signal") or "").strip().upper()
+    previous_signal = (
+        str(ordered_signals[current_index - 1].get("Signal") or "").strip().upper()
+        if current_index > 0
+        else None
+    )
+    next_signal = (
+        str(ordered_signals[current_index + 1].get("Signal") or "").strip().upper()
+        if current_index + 1 < len(ordered_signals)
+        else None
+    )
+
+    if previous_signal == current_signal:
+        expected = "SELL" if previous_signal == "BUY" else "BUY"
+        return f"Previous trade is {previous_signal}. Please mark {expected} next."
+
+    if next_signal == current_signal:
+        expected = "SELL" if current_signal == "BUY" else "BUY"
+        return f"Next trade near this candle is already {next_signal}. This candle should be {expected} to keep alternation."
+
+    return None
+
+
+@st.dialog("Trade Warning", width="medium")
+def render_trade_warning_dialog(message: str) -> None:
+    st.warning(message)
+
+
+@st.dialog("Update Indicator Requirements", width="large")
+def render_indicator_requirements_dialog(main_dir: Path, requirements: list[dict[str, Any]]) -> None:
+    st.write("The raw file format has duplicate or repeated indicators. Please label them before the app processes the data.")
+    st.caption(f"Workspace: {main_dir}")
+    current_config = load_indicator_config(main_dir)
+    configured_labels = dict(current_config.get("column_labels") or {})
+
+    pending_labels: dict[str, str] = {}
+    for requirement in requirements:
+        family_label = str(requirement.get("family_label") or "Indicator")
+        family_key = str(requirement.get("family_key") or family_label)
+        columns = [str(column).strip() for column in requirement.get("columns", []) if str(column).strip()]
+        if not columns:
+            continue
+        st.markdown(f"**{family_label}**")
+        for index, column_name in enumerate(columns, start=1):
+            widget_key = indicator_key_for_widget(main_dir, family_key, column_name)
+            default_value = configured_labels.get(column_name) or f"{family_label} {index}"
+            pending_labels[column_name] = st.text_input(
+                f"{column_name}",
+                value=default_value,
+                key=widget_key,
+            ).strip()
+
+    save_col, cancel_col = st.columns(2, gap="small")
+    with save_col:
+        if st.button("Save and Process", width="stretch", key="save-indicator-requirements"):
+            validation_errors: list[str] = []
+            for requirement in requirements:
+                columns = [str(column).strip() for column in requirement.get("columns", []) if str(column).strip()]
+                family_label = str(requirement.get("family_label") or "Indicator")
+                labels = [pending_labels.get(column, "").strip() for column in columns]
+                if any(not label for label in labels):
+                    validation_errors.append(f"{family_label}: every duplicate indicator needs a name.")
+                    continue
+                if len(set(label.casefold() for label in labels)) != len(labels):
+                    validation_errors.append(f"{family_label}: indicator names must be different.")
+            if validation_errors:
+                for message in validation_errors:
+                    st.error(message)
+            else:
+                updated_config = load_indicator_config(main_dir)
+                updated_config.setdefault("column_labels", {})
+                updated_config["column_labels"].update(pending_labels)
+                save_indicator_config(main_dir, updated_config)
+                input_dir = Path(main_dir) / "Input Files"
+                clear_supported_data_files(input_dir)
+                st.session_state.auto_process_signature = None
+                st.session_state.auto_process_main_dir = None
+                st.session_state.chart_payload_signature = None
+                st.session_state.chart_payload_data = None
+                list_symbols.clear()
+                list_instruments.clear()
+                load_data.clear()
+                st.rerun()
+    with cancel_col:
+        if st.button("Close", width="stretch", key="close-indicator-requirements"):
+            st.rerun()
+
+
+@st.dialog("Remove Trade", width="small")
+def render_remove_trade_dialog(message: str) -> None:
+    st.write(message)
+    col_yes, col_no = st.columns(2, gap="small")
+    with col_yes:
+        if st.button("Yes", width="stretch", key="confirm-remove-trade-yes"):
+            st.session_state.remove_trade_confirmed = True
+            st.rerun()
+    with col_no:
+        if st.button("No", width="stretch", key="confirm-remove-trade-no"):
+            st.session_state.remove_trade_pending = None
+            st.session_state.remove_trade_dialog_token = int(st.session_state.get("remove_trade_dialog_token", 0) or 0)
+            st.rerun()
+
+
+@st.dialog("Delete Strategy", width="small")
+def render_delete_strategy_dialog(strategy_name: str) -> None:
+    st.warning(f"Delete strategy '{strategy_name}'?")
+    st.caption("This will delete the strategy folder and its saved trade files.")
+    col_yes, col_no = st.columns(2, gap="small")
+    with col_yes:
+        if st.button("Yes", width="stretch", key="confirm-delete-strategy-yes"):
+            st.session_state.delete_strategy_confirmed = True
+            st.rerun()
+    with col_no:
+        if st.button("No", width="stretch", key="confirm-delete-strategy-no"):
+            st.session_state.delete_strategy_pending = None
+            st.rerun()
+
+
+@st.dialog("Delete Scrip", width="small")
+def render_delete_scrip_dialog(label: str) -> None:
+    st.warning(f"Delete loaded files for {label}?")
+    st.caption("This will delete the matching Raw, Input, and Output files for the currently loaded scrip.")
+    col_yes, col_no = st.columns(2, gap="small")
+    with col_yes:
+        if st.button("Yes", width="stretch", key="confirm-delete-scrip-yes"):
+            st.session_state.delete_scrip_confirmed = True
+            st.rerun()
+    with col_no:
+        if st.button("No", width="stretch", key="confirm-delete-scrip-no"):
+            st.session_state.delete_scrip_pending = None
+            st.rerun()
+
+
+@st.dialog("Software Update", width="small")
+def render_software_update_dialog(update_info: dict[str, Any]) -> None:
+    latest_version = str(update_info.get("version") or "").strip()
+    current_version = str(update_info.get("current_version") or "").strip()
+    st.write(f"A new version is available: `{latest_version}`")
+    st.caption(f"Current version: {current_version}")
+    col_yes, col_no = st.columns(2, gap="small")
+    with col_yes:
+        if st.button("Update Now", width="stretch", key="software-update-now"):
+            asset_url = str(update_info.get("asset_url") or "").strip()
+            if not asset_url:
+                st.error("Update asset URL is missing.")
+            else:
+                launch_update_installer(BASE_DIR, asset_url, latest_version)
+                st.session_state.update_prompt_dismissed_version = latest_version
+                st.session_state.update_launching = True
+                st.rerun()
+    with col_no:
+        if st.button("Later", width="stretch", key="software-update-later"):
+            st.session_state.update_prompt_dismissed_version = latest_version
+            st.rerun()
+
+
+@st.dialog("Edit Settings", width="large")
+def render_edit_settings_dialog(
+    *,
+    main_dir: Path,
+    output_dir: Path,
+    symbol: str,
+    available_symbols: list[str],
+    min_date: Any,
+    max_date: Any,
+    active_strategy: str,
+    available_strategies: list[str],
+    indicator_groups: list[dict[str, Any]],
+    indicator_group_keys: list[str],
+    indicator_color_config: dict[str, str],
+    indicator_enabled_config: dict[str, bool],
+    indicator_line_width_config: dict[str, int],
+    active_chart_type: str,
+    default_from_date: Any,
+    active_timeframe_label: str,
+    exchange_label: str,
+) -> None:
+    st.caption("Update scrip, filters, strategy, indicators, and file actions from one place.")
+
+    selected_symbol_value = st.selectbox(
+        "Select Scrip",
+        available_symbols,
+        index=available_symbols.index(symbol) if symbol in available_symbols else 0,
+        format_func=display_symbol,
+        key="edit-settings-symbol",
+    )
+    qty_value = st.number_input(
+        "Qty",
+        min_value=1,
+        step=1,
+        format="%d",
+        value=int(st.session_state.get("qty", 1) or 1),
+        key="edit-settings-qty",
+    )
+    chart_type_value = st.selectbox(
+        "Chart Type",
+        ["Candlestick", "Line Chart"],
+        index=0 if str(active_chart_type) == "Candlestick" else 1,
+        key="edit-settings-chart-type",
+    )
+    date_col_1, date_col_2 = st.columns(2, gap="small")
+    with date_col_1:
+        from_date_value = st.date_input(
+            "From Date",
+            value=st.session_state.get("filter_from_date", default_from_date),
+            min_value=min_date,
+            max_value=max_date,
+            format="DD/MM/YYYY",
+            key="edit-settings-from-date",
+        )
+    with date_col_2:
+        to_date_value = st.date_input(
+            "To Date",
+            value=st.session_state.get("filter_to_date", max_date),
+            min_value=min_date,
+            max_value=max_date,
+            format="DD/MM/YYYY",
+            key="edit-settings-to-date",
+        )
+    if from_date_value > to_date_value:
+        st.warning("From Date cannot be after To Date.")
+
+    section_top = st.columns(2, gap="small")
+    with section_top[0]:
+        st.markdown("**Strategy**")
+        pending_strategy = st.selectbox(
+            "Active Strategy",
+            available_strategies,
+            index=available_strategies.index(active_strategy),
+            key="edit-settings-active-strategy",
+        )
+        new_strategy_name = st.text_input(
+            "Add Strategy",
+            value="",
+            placeholder="Type a strategy name",
+            key="edit-settings-new-strategy",
+        ).strip()
+        strategy_buttons = st.columns(3, gap="small")
+        with strategy_buttons[0]:
+            if st.button("Use", width="stretch", key="edit-settings-use-strategy"):
+                selected_strategy_name = sanitize_strategy_name(pending_strategy) or DEFAULT_STRATEGY_NAME
+                updated_config = load_indicator_config(main_dir)
+                updated_config["default_strategy"] = selected_strategy_name
+                save_indicator_config(main_dir, updated_config)
+                st.session_state.selected_strategy = selected_strategy_name
+                st.session_state.edit_settings_open = False
+                st.rerun()
+        with strategy_buttons[1]:
+            if st.button("Create", width="stretch", key="edit-settings-create-strategy"):
+                safe_strategy_name = sanitize_strategy_name(new_strategy_name)
+                if not safe_strategy_name:
+                    st.warning("Enter a strategy name first.")
+                elif safe_strategy_name in available_strategies:
+                    st.warning("That strategy already exists.")
+                else:
+                    strategy_output_dir(output_dir, safe_strategy_name).mkdir(parents=True, exist_ok=True)
+                    updated_config = load_indicator_config(main_dir)
+                    updated_config["default_strategy"] = safe_strategy_name
+                    save_indicator_config(main_dir, updated_config)
+                    st.session_state.selected_strategy = safe_strategy_name
+                    st.session_state.edit_settings_open = False
+                    st.rerun()
+        with strategy_buttons[2]:
+            if st.button(
+                "Delete",
+                width="stretch",
+                disabled=sanitize_strategy_name(pending_strategy).casefold() == DEFAULT_STRATEGY_NAME.casefold(),
+                key="edit-settings-delete-strategy",
+            ):
+                st.session_state.delete_strategy_pending = sanitize_strategy_name(pending_strategy)
+                st.session_state.delete_strategy_dialog_token = int(st.session_state.get("delete_strategy_dialog_token", 0) or 0) + 1
+                st.session_state.edit_settings_open = False
+                st.rerun()
+
+    with section_top[1]:
+        st.markdown("**Edit Scrip**")
+        st.caption("Delete the loaded raw/input/output files for the current instrument.")
+        if st.button(
+            f"Delete {display_symbol(symbol)} {active_timeframe_label}",
+            width="stretch",
+            key="edit-settings-delete-scrip",
+        ):
+            st.session_state.delete_scrip_pending = f"{display_symbol(symbol)} · {active_timeframe_label} · {exchange_label}"
+            st.session_state.delete_scrip_dialog_token = int(st.session_state.get("delete_scrip_dialog_token", 0) or 0) + 1
+            st.session_state.edit_settings_open = False
+            st.rerun()
+
+    st.markdown("---")
+    st.markdown("**Indicators**")
+    if indicator_groups:
+        pending_indicator_enabled: dict[str, bool] = {}
+        pending_indicator_names: dict[str, str] = {}
+        pending_indicator_colors: dict[str, str] = {}
+        pending_indicator_line_widths: dict[str, int] = {}
+        line_width_labels = list(INDICATOR_LINE_WIDTH_LABELS.values())
+        for group in indicator_groups:
+            group_key = str(group.get("key") or "")
+            group_name = str(group.get("name") or group_key)
+            default_name = str(group.get("default_name") or group_name)
+            current_enabled = group_key in st.session_state.get("selected_indicator_keys", [])
+            st.markdown(f"**{group_name}**")
+            pending_indicator_enabled[group_key] = st.toggle(
+                "Show Indicator",
+                value=current_enabled,
+                key=f"dialog-indicator-enable-{group_key}",
+            )
+            rename_toggle, color_toggle, width_col = st.columns(3, gap="small")
+            with rename_toggle:
+                rename_enabled = st.toggle(
+                    "Rename",
+                    value=False,
+                    key=f"dialog-indicator-rename-toggle-{group_key}",
+                )
+            with color_toggle:
+                color_enabled = st.toggle(
+                    "Change Color",
+                    value=False,
+                    key=f"dialog-indicator-color-toggle-{group_key}",
+                )
+            with width_col:
+                default_width_label = indicator_line_width_label(
+                    indicator_line_width_config.get(group_key, INDICATOR_LINE_WIDTH_OPTIONS["medium"])
+                )
+                pending_indicator_line_widths[group_key] = indicator_line_width_value(
+                    st.selectbox(
+                        "Line Width",
+                        line_width_labels,
+                        index=line_width_labels.index(default_width_label),
+                        key=f"dialog-indicator-width-{group_key}",
+                    )
+                )
+            if rename_enabled:
+                pending_indicator_names[group_key] = st.text_input(
+                    "Indicator Name",
+                    value=group_name,
+                    key=f"dialog-indicator-name-{group_key}",
+                ).strip() or default_name
+            if color_enabled:
+                color_labels = indicator_color_labels(group)
+                default_color_values = {
+                    setting_key: indicator_color_config.get(setting_key, default_value)
+                    for setting_key, default_value in default_indicator_colors(group).items()
+                }
+                for setting_key, default_value in default_color_values.items():
+                    pending_indicator_colors[setting_key] = st.color_picker(
+                        color_labels.get(setting_key, setting_key),
+                        value=default_value,
+                        key=f"dialog-indicator-color-{group_key}-{setting_key.replace(' ', '-').lower()}",
+                    )
+            st.markdown("<div style='height:0.4rem;'></div>", unsafe_allow_html=True)
+
+        if st.button("Save Indicator Settings", width="stretch", key="dialog-save-indicator-settings"):
+            updated_config = load_indicator_config(main_dir)
+            updated_config.setdefault("indicator_colors", {})
+            updated_config.setdefault("indicator_display_names", {})
+            updated_config.setdefault("indicator_enabled", {})
+            updated_config.setdefault("indicator_line_widths", {})
+            updated_config["indicator_enabled"].update(pending_indicator_enabled)
+            updated_config["indicator_line_widths"].update(pending_indicator_line_widths)
+            for group in indicator_groups:
+                group_key = str(group.get("key") or "")
+                default_name = str(group.get("default_name") or group.get("name") or group_key)
+                new_name = str(pending_indicator_names.get(group_key) or default_name).strip()
+                if new_name and new_name != default_name:
+                    updated_config["indicator_display_names"][group_key] = new_name
+                else:
+                    updated_config["indicator_display_names"].pop(group_key, None)
+            updated_config["indicator_colors"].update(pending_indicator_colors)
+            save_indicator_config(main_dir, updated_config)
+            st.session_state.selected_indicator_keys = [
+                group_key
+                for group_key in indicator_group_keys
+                if pending_indicator_enabled.get(group_key, True)
+            ]
+            st.session_state.chart_payload_signature = None
+            st.session_state.chart_payload_data = None
+            st.session_state.edit_settings_open = False
+            st.rerun()
+    else:
+        st.caption("No indicators found in the current input file.")
+
+    st.markdown("---")
+    footer_cols = st.columns(3, gap="small")
+    with footer_cols[0]:
+        if st.button("Apply", width="stretch", key="dialog-apply-settings"):
+            if from_date_value > to_date_value:
+                st.error("From Date cannot be after To Date.")
+            else:
+                st.session_state.selected_symbol = selected_symbol_value
+                st.session_state.qty = int(qty_value)
+                st.session_state.chart_type = str(chart_type_value)
+                st.session_state.filter_from_date = from_date_value
+                st.session_state.filter_to_date = to_date_value
+                st.session_state.chart_window_start = from_date_value
+                st.session_state.filter_source_from = from_date_value
+                st.session_state.filter_source_to = to_date_value
+                st.session_state.saved_signals_selected_rows = []
+                reset_clicked_candle()
+                st.session_state.chart_payload_signature = None
+                st.session_state.chart_payload_data = None
+                st.session_state.edit_settings_open = False
+                st.rerun()
+    with footer_cols[1]:
+        if st.button("Reset", width="stretch", key="dialog-reset-settings"):
+            st.session_state.pending_reset_filters = True
+            st.session_state.edit_settings_open = False
+            st.rerun()
+    with footer_cols[2]:
+        if st.button("Close", width="stretch", key="dialog-close-settings"):
+            st.session_state.edit_settings_open = False
+            st.rerun()
+
+
 def save_signal(signal_record: dict[str, Any], output_csv_path: Path) -> bool:
     existing_keys = {item["SignalKey"] for item in st.session_state.saved_signals}
     if signal_record["SignalKey"] in existing_keys:
         st.session_state.latest_signal = signal_record
+        return False
+
+    validation_message = validate_signal_sequence(signal_record, st.session_state.saved_signals)
+    if validation_message:
+        next_token = int(st.session_state.get("trade_warning_dialog_token", 0) or 0) + 1
+        st.session_state.trade_warning_dialog_token = next_token
+        st.session_state.trade_warning_dialog_message = validation_message
         return False
 
     updated_signals = [*st.session_state.saved_signals, signal_record]
@@ -1582,6 +2522,13 @@ def reset_clicked_candle() -> None:
     st.session_state.clicked_date = None
     st.session_state.clicked_time = None
     st.session_state.clicked_epoch = None
+
+
+def clear_chart_selection() -> None:
+    reset_clicked_candle()
+    st.session_state.pop("clicked_info", None)
+    st.session_state.last_chart_click_token = None
+    st.session_state.last_chart_click_at = 0.0
 
 
 def sync_clicked_candle_with_view(chart_df: pd.DataFrame) -> None:
@@ -1927,6 +2874,11 @@ DASHBOARD_OUTPUT_COLUMNS = [
     "PL Amt",
     "Candle Analysis",
 ]
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_latest_release_info_cached(base_dir_text: str) -> dict[str, Any] | None:
+    return fetch_latest_release_info(Path(base_dir_text))
 DASHBOARD_EPSILON = 1e-9
 CARD_STYLE = """
 <style>
@@ -1987,6 +2939,64 @@ def dashboard_strategy_dirs(output_dir: Path) -> list[Path]:
         if child.is_dir() and dashboard_folder_signature(child):
             folders.append(child)
     return folders
+
+
+def delete_selected_instrument_files(
+    raw_dir: Path,
+    input_dir: Path,
+    output_dir: Path,
+    selected_identity: InstrumentIdentity,
+    stems_to_delete: list[str],
+) -> dict[str, int]:
+    raw_deleted = 0
+    input_deleted = 0
+    output_deleted = 0
+    target_storage_stem = str(selected_identity.storage_stem or "").casefold()
+    target_stems = {str(stem).casefold() for stem in stems_to_delete if str(stem).strip()}
+
+    for file_path in list_supported_data_files(raw_dir):
+        try:
+            identity = parse_instrument_identity(file_path.name)
+        except Exception:
+            continue
+        if identity.storage_stem.casefold() != target_storage_stem:
+            continue
+        try:
+            file_path.unlink()
+            raw_deleted += 1
+        except OSError:
+            continue
+
+    for file_path in list_supported_data_files(input_dir):
+        file_stem = file_path.stem.casefold()
+        try:
+            identity = parse_instrument_identity(file_path.name)
+            matches_identity = identity.storage_stem.casefold() == target_storage_stem
+        except Exception:
+            matches_identity = False
+        if not matches_identity and file_stem not in target_stems:
+            continue
+        try:
+            file_path.unlink()
+            input_deleted += 1
+        except OSError:
+            continue
+
+    for folder in [output_dir, *dashboard_strategy_dirs(output_dir)]:
+        for file_path in list_supported_data_files(folder):
+            if file_path.stem.casefold() not in target_stems:
+                continue
+            try:
+                file_path.unlink()
+                output_deleted += 1
+            except OSError:
+                continue
+
+    return {
+        "raw_deleted": raw_deleted,
+        "input_deleted": input_deleted,
+        "output_deleted": output_deleted,
+    }
 
 
 def dashboard_normalize_time_text(value: Any) -> str:
@@ -3655,60 +4665,35 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
     min_entry_date = valid_entry_timestamps.min().date()
     max_entry_date = valid_entry_timestamps.max().date()
 
-    with st.container():
-        st.markdown("### Filters")
-        filter_col_a, filter_col_b, filter_col_c = st.columns([1.0, 1.0, 1.3])
-        with filter_col_a:
-            filter_from_date = st.date_input(
-                "Entry Date From",
-                value=min_entry_date,
-                min_value=min_entry_date,
-                max_value=max_entry_date,
-                format="DD/MM/YYYY",
-                key="dashboard_filter_from_date",
-            )
-        with filter_col_b:
-            filter_to_date = st.date_input(
-                "Entry Date To",
-                value=max_entry_date,
-                min_value=min_entry_date,
-                max_value=max_entry_date,
-                format="DD/MM/YYYY",
-                key="dashboard_filter_to_date",
-            )
-        available_scrips = sorted(reference_df["Scrip"].dropna().astype(str).unique().tolist(), key=str.lower)
-        scrip_filter_key = "dashboard_filter_scrips"
-        select_all_label = "SELECT ALL"
-        if scrip_filter_key not in st.session_state:
-            st.session_state[scrip_filter_key] = [select_all_label]
-        else:
-            prior_selection = [str(value or "").upper() for value in st.session_state.get(scrip_filter_key, [])]
-            chosen_scrips = [value for value in prior_selection if value != select_all_label and value in available_scrips]
-            st.session_state[scrip_filter_key] = [select_all_label] if select_all_label in prior_selection or len(chosen_scrips) == len(available_scrips) else chosen_scrips
-        with filter_col_c:
-            raw_selected_scrips = st.multiselect(
-                "Scrip",
-                options=[select_all_label] + available_scrips,
-                key=scrip_filter_key,
-                help="This filter applies to KPI, charts, summary, drill-down, and PDF report.",
-            )
-            selected_dashboard_scrips = available_scrips if select_all_label in raw_selected_scrips else raw_selected_scrips
-        include_open_trades = False
-        if filter_from_date > filter_to_date:
-            st.warning("From date cannot be after To date.")
-            return
-    if not selected_dashboard_scrips:
-        st.warning("Please select at least one scrip.")
-        return
-    preview_filtered_df = filter_dashboard_trade_rows(
+    available_scrips = sorted(reference_df["Scrip"].dropna().astype(str).unique().tolist(), key=str.lower)
+    scrip_filter_key = "dashboard_filter_scrips"
+    select_all_label = "SELECT ALL"
+    if scrip_filter_key not in st.session_state:
+        st.session_state[scrip_filter_key] = [select_all_label]
+    else:
+        prior_selection = [str(value or "").upper() for value in st.session_state.get(scrip_filter_key, [])]
+        chosen_scrips = [value for value in prior_selection if value != select_all_label and value in available_scrips]
+        st.session_state[scrip_filter_key] = [select_all_label] if select_all_label in prior_selection or len(chosen_scrips) == len(available_scrips) else chosen_scrips
+
+    current_filter_from_date = st.session_state.get("dashboard_filter_from_date", min_entry_date)
+    current_filter_to_date = st.session_state.get("dashboard_filter_to_date", max_entry_date)
+    if hasattr(current_filter_from_date, "date"):
+        current_filter_from_date = current_filter_from_date.date()
+    if hasattr(current_filter_to_date, "date"):
+        current_filter_to_date = current_filter_to_date.date()
+    current_filter_from_date = min(max(current_filter_from_date, min_entry_date), max_entry_date)
+    current_filter_to_date = min(max(current_filter_to_date, min_entry_date), max_entry_date)
+    current_raw_selected_scrips = st.session_state.get(scrip_filter_key, [select_all_label])
+    current_selected_dashboard_scrips = available_scrips if select_all_label in current_raw_selected_scrips else [scrip for scrip in current_raw_selected_scrips if scrip in available_scrips]
+    current_preview_filtered_df = filter_dashboard_trade_rows(
         root_df,
-        filter_from_date,
-        filter_to_date,
+        current_filter_from_date,
+        current_filter_to_date,
         False,
-        selected_scrips=selected_dashboard_scrips,
+        selected_scrips=current_selected_dashboard_scrips,
     )
-    active_scrip_count = int(preview_filtered_df["Scrip"].nunique()) if not preview_filtered_df.empty else len(selected_dashboard_scrips)
-    selected_scrips_text = select_all_label if len(selected_dashboard_scrips) == len(available_scrips) else ", ".join(display_symbol(scrip) for scrip in selected_dashboard_scrips)
+    current_active_scrip_count = int(current_preview_filtered_df["Scrip"].nunique()) if not current_preview_filtered_df.empty else len(current_selected_dashboard_scrips)
+
     input_header_col, export_button_col, input_popover_col = st.columns([0.52, 0.24, 0.24])
     with input_header_col:
         if prop_dashboard_enabled:
@@ -3750,19 +4735,65 @@ def render_interactive_output_dashboard(output_dir: Path) -> None:
                     step=0.5,
                     key="dashboard_prop_interest_rate",
                 )
-                capital_preview = avg_value_traded_per_lot * 0.25 * 0.20 * active_scrip_count
-                monthly_interest_preview = avg_value_traded_per_lot * active_scrip_count * 0.25 * ((interest_rate_pct / 100.0) / 12.0)
+                capital_preview = avg_value_traded_per_lot * 0.25 * 0.20 * current_active_scrip_count
+                monthly_interest_preview = avg_value_traded_per_lot * current_active_scrip_count * 0.25 * ((interest_rate_pct / 100.0) / 12.0)
                 st.metric("Capital", format_inr(capital_preview))
                 st.metric("Interest / Month", format_inr(monthly_interest_preview))
-                st.caption(f"Active Scrips in current filter: {active_scrip_count}")
+                st.caption(f"Active Scrips in current filter: {current_active_scrip_count}")
                 st.caption("Capital = Value Traded x 25% x 20% x Active Scrips")
                 st.caption("Interest / Month = Active Scrips x Value Traded x 25% x (Annual Interest Rate / 12)")
             else:
-                capital_preview = avg_value_traded_per_lot * 0.25 * active_scrip_count
+                capital_preview = avg_value_traded_per_lot * 0.25 * current_active_scrip_count
                 st.metric("Capital", format_inr(capital_preview))
-                st.caption(f"Active Scrips in current filter: {active_scrip_count}")
+                st.caption(f"Active Scrips in current filter: {current_active_scrip_count}")
                 st.caption("Capital = Value Traded x 25% x Active Scrips")
                 st.caption("Current mode deducts only the estimated charges per trade.")
+
+    with st.container():
+        st.markdown("### Filters")
+        filter_col_a, filter_col_b, filter_col_c = st.columns([1.0, 1.0, 1.3])
+        with filter_col_a:
+            filter_from_date = st.date_input(
+                "Entry Date From",
+                value=min_entry_date,
+                min_value=min_entry_date,
+                max_value=max_entry_date,
+                format="DD/MM/YYYY",
+                key="dashboard_filter_from_date",
+            )
+        with filter_col_b:
+            filter_to_date = st.date_input(
+                "Entry Date To",
+                value=max_entry_date,
+                min_value=min_entry_date,
+                max_value=max_entry_date,
+                format="DD/MM/YYYY",
+                key="dashboard_filter_to_date",
+            )
+        with filter_col_c:
+            raw_selected_scrips = st.multiselect(
+                "Scrip",
+                options=[select_all_label] + available_scrips,
+                key=scrip_filter_key,
+                help="This filter applies to KPI, charts, summary, drill-down, and PDF report.",
+            )
+            selected_dashboard_scrips = available_scrips if select_all_label in raw_selected_scrips else raw_selected_scrips
+        include_open_trades = False
+        if filter_from_date > filter_to_date:
+            st.warning("From date cannot be after To date.")
+            return
+    if not selected_dashboard_scrips:
+        st.warning("Please select at least one scrip.")
+        return
+    preview_filtered_df = filter_dashboard_trade_rows(
+        root_df,
+        filter_from_date,
+        filter_to_date,
+        False,
+        selected_scrips=selected_dashboard_scrips,
+    )
+    active_scrip_count = int(preview_filtered_df["Scrip"].nunique()) if not preview_filtered_df.empty else len(selected_dashboard_scrips)
+    selected_scrips_text = select_all_label if len(selected_dashboard_scrips) == len(available_scrips) else ", ".join(display_symbol(scrip) for scrip in selected_dashboard_scrips)
     filters_text = (
         f"Entry Date: {filter_from_date:%d-%b-%Y} to {filter_to_date:%d-%b-%Y} | "
         f"Scrips: {selected_scrips_text} | Include Open Trades: No"
@@ -4264,6 +5295,7 @@ def main() -> None:
     st.set_page_config(page_title="EMA Trade Viewer", layout="wide")
     is_windows = sys.platform.startswith("win")
     cloud_workspace_root = Path(tempfile.gettempdir()) / "ema_trade_viewer_uploads"
+    default_local_main_dir = BASE_DIR / "Main Folder"
 
     st.session_state.setdefault("saved_signals", [])
     st.session_state.setdefault("latest_signal", None)
@@ -4272,10 +5304,6 @@ def main() -> None:
     st.session_state.setdefault("clicked_date", None)
     st.session_state.setdefault("clicked_time", None)
     st.session_state.setdefault("clicked_epoch", None)
-    st.session_state.setdefault(
-        "chart_replay_state",
-        {"active": False, "index": None, "showStartLine": False},
-    )
     st.session_state.setdefault("show_filters", True)
     st.session_state.setdefault("confirm_clear_all", False)
     st.session_state.setdefault("saved_signals_selected_row", None)
@@ -4284,6 +5312,7 @@ def main() -> None:
     st.session_state.setdefault("saved_signals_output_csv", None)
     st.session_state.setdefault("show_saved_signals_panel", True)
     st.session_state.setdefault("build_signature", None)
+    st.session_state.setdefault("drive_output_dir_path_input", str(DEFAULT_DRIVE_OUTPUT_DIR))
     st.session_state.setdefault("qty", 1)
     st.session_state.setdefault("last_chart_click_token", None)
     st.session_state.setdefault("last_chart_click_at", 0.0)
@@ -4296,47 +5325,63 @@ def main() -> None:
     st.session_state.setdefault("output_dir_path_input", "")
     st.session_state.setdefault("process_feedback_level", None)
     st.session_state.setdefault("process_feedback_message", "")
-    st.session_state.setdefault("drive_manual_input_downloads", [])
+    st.session_state.setdefault("cleanup_feedback_level", None)
+    st.session_state.setdefault("cleanup_feedback_message", "")
+    st.session_state.setdefault("auto_process_signature", None)
+    st.session_state.setdefault("auto_process_main_dir", None)
+    st.session_state.setdefault("output_cleanup_key", None)
+    st.session_state.setdefault("chart_payload_signature", None)
+    st.session_state.setdefault("chart_payload_data", None)
+    st.session_state.setdefault("selected_indicator_keys", [])
+    st.session_state.setdefault("chart_type", "Candlestick")
+    st.session_state.setdefault("trade_warning_dialog_token", 0)
+    st.session_state.setdefault("trade_warning_dialog_shown_token", 0)
+    st.session_state.setdefault("trade_warning_dialog_message", "")
+    st.session_state.setdefault("remove_trade_dialog_token", 0)
+    st.session_state.setdefault("remove_trade_dialog_shown_token", 0)
+    st.session_state.setdefault("remove_trade_pending", None)
+    st.session_state.setdefault("remove_trade_confirmed", False)
+    st.session_state.setdefault("skip_next_chart_event", False)
     st.session_state.setdefault("filter_data_dir", None)
     st.session_state.setdefault("filter_output_dir", None)
     st.session_state.setdefault("selected_symbol", None)
     st.session_state.setdefault("selected_symbol_restore", None)
+    st.session_state.setdefault("selected_timeframe", None)
+    st.session_state.setdefault("selected_strategy", DEFAULT_STRATEGY_NAME)
+    st.session_state.setdefault("pending_reset_filters", False)
+    st.session_state.setdefault("edit_settings_open", False)
+    st.session_state.setdefault("delete_strategy_pending", None)
+    st.session_state.setdefault("delete_strategy_confirmed", False)
+    st.session_state.setdefault("delete_strategy_dialog_token", 0)
+    st.session_state.setdefault("delete_strategy_dialog_shown_token", 0)
+    st.session_state.setdefault("delete_scrip_pending", None)
+    st.session_state.setdefault("delete_scrip_confirmed", False)
+    st.session_state.setdefault("delete_scrip_dialog_token", 0)
+    st.session_state.setdefault("delete_scrip_dialog_shown_token", 0)
+    st.session_state.setdefault("update_check_done", False)
+    st.session_state.setdefault("update_info", None)
+    st.session_state.setdefault("update_prompt_dismissed_version", "")
+    st.session_state.setdefault("update_launching", False)
     st.session_state.setdefault("cloud_workspace_session_id", str(uuid4()))
-    st.session_state.setdefault("show_drive_process_dialog", False)
-    st.session_state.setdefault("drive_process_choice_widget", "No")
-    st.session_state.setdefault("drive_selected_symbols", [])
-    st.session_state.setdefault("drive_dialog_feedback_level", None)
-    st.session_state.setdefault("drive_dialog_feedback_message", "")
-    st.session_state.setdefault("drive_input_sync_choice", None)
-    st.session_state.setdefault("drive_input_sync_file_count", 0)
-    st.session_state.setdefault("drive_output_sync_completed", False)
-    st.session_state.setdefault("output_reload_feedback_level", None)
-    st.session_state.setdefault("output_reload_feedback_message", "")
-    st.session_state.setdefault("output_update_feedback_level", None)
-    st.session_state.setdefault("output_update_feedback_message", "")
-    st.session_state.setdefault("output_update_manual_download", None)
-    cloud_workspace_dir = cloud_workspace_root / st.session_state.cloud_workspace_session_id
-    drive_status = get_google_drive_connection_status()
-    drive_raw_files: list[Any] = []
-    drive_raw_symbol_files: dict[str, list[Any]] = {}
-    drive_raw_symbol_names: list[str] = []
-    drive_raw_files_error = ""
-    if drive_status.connected and drive_status.raw_folder is not None:
+
+    if (
+        is_windows
+        and not st.session_state.get("main_dir_path_input")
+        and default_local_main_dir.exists()
+        and default_local_main_dir.is_dir()
+    ):
+        st.session_state.main_dir_path_input = str(default_local_main_dir)
+        st.session_state.data_dir_path_input = str(default_local_main_dir / "Input Files")
+
+    if not st.session_state.get("update_check_done"):
         try:
-            drive_raw_files = filter_supported_google_drive_files(
-                list_google_drive_folder_files(drive_status.raw_folder.folder_id)
-            )
-            drive_raw_symbol_files = group_google_drive_files_by_symbol(drive_raw_files)
-            drive_raw_symbol_names = list(drive_raw_symbol_files.keys())
-        except Exception as exc:
-            drive_raw_files_error = str(exc)
-    selected_drive_symbols = [
-        symbol
-        for symbol in st.session_state.get("drive_selected_symbols", [])
-        if symbol in drive_raw_symbol_names
-    ]
-    if selected_drive_symbols != st.session_state.get("drive_selected_symbols", []):
-        st.session_state.drive_selected_symbols = selected_drive_symbols
+            st.session_state.update_info = fetch_latest_release_info_cached(str(BASE_DIR))
+        except Exception:
+            st.session_state.update_info = None
+        st.session_state.update_check_done = True
+        st.session_state.output_dir_path_input = str(default_local_main_dir / "Output Files")
+
+    cloud_workspace_dir = cloud_workspace_root / st.session_state.cloud_workspace_session_id
     if (
         not st.session_state.main_dir_path_input
         and not is_windows
@@ -4345,6 +5390,41 @@ def main() -> None:
         st.session_state.main_dir_path_input = str(cloud_workspace_dir)
         st.session_state.data_dir_path_input = str(cloud_workspace_dir / "Input Files")
         st.session_state.output_dir_path_input = str(cloud_workspace_dir / "Output Files")
+
+    main_dir_raw_for_auto = str(st.session_state.get("main_dir_path_input") or "").strip()
+    if main_dir_raw_for_auto:
+        auto_main_dir = resolve_main_workspace_dir(main_dir_raw_for_auto)
+        auto_main_dir_key = str(auto_main_dir)
+        auto_raw_dir = auto_main_dir / "Raw Files"
+        auto_input_dir = auto_main_dir / "Input Files"
+        auto_output_dir = auto_main_dir / "Output Files"
+        unresolved_indicator_requirements = (
+            get_unresolved_indicator_requirements(auto_raw_dir, auto_main_dir)
+            if auto_raw_dir.exists() and auto_raw_dir.is_dir()
+            else []
+        )
+        if (
+            auto_main_dir.exists()
+            and auto_main_dir.is_dir()
+            and auto_raw_dir.exists()
+            and auto_raw_dir.is_dir()
+        ):
+            auto_input_dir.mkdir(parents=True, exist_ok=True)
+            auto_output_dir.mkdir(parents=True, exist_ok=True)
+            if (
+                auto_input_dir.is_dir()
+                and auto_output_dir.is_dir()
+                and can_write_to_directory(auto_output_dir)
+                and st.session_state.get("auto_process_main_dir") != auto_main_dir_key
+                and not unresolved_indicator_requirements
+            ):
+                auto_process_input_files_if_needed(
+                    auto_main_dir,
+                    auto_raw_dir,
+                    auto_input_dir,
+                    indicator_labels=get_indicator_label_config(auto_main_dir),
+                )
+                st.session_state.auto_process_main_dir = auto_main_dir_key
 
     st.markdown(
         f"""
@@ -4469,120 +5549,56 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    warning_token = int(st.session_state.get("trade_warning_dialog_token", 0) or 0)
+    shown_warning_token = int(st.session_state.get("trade_warning_dialog_shown_token", 0) or 0)
+    warning_message = str(st.session_state.get("trade_warning_dialog_message") or "").strip()
+    if warning_message and warning_token > shown_warning_token:
+        st.session_state.trade_warning_dialog_shown_token = warning_token
+        render_trade_warning_dialog(warning_message)
+
+    remove_trade_token = int(st.session_state.get("remove_trade_dialog_token", 0) or 0)
+    shown_remove_trade_token = int(st.session_state.get("remove_trade_dialog_shown_token", 0) or 0)
+    pending_remove_trade = st.session_state.get("remove_trade_pending")
+    if pending_remove_trade and remove_trade_token > shown_remove_trade_token:
+        st.session_state.remove_trade_dialog_shown_token = remove_trade_token
+        render_remove_trade_dialog("Do you want to remove this trade?")
+
+    delete_strategy_token = int(st.session_state.get("delete_strategy_dialog_token", 0) or 0)
+    shown_delete_strategy_token = int(st.session_state.get("delete_strategy_dialog_shown_token", 0) or 0)
+    pending_delete_strategy = str(st.session_state.get("delete_strategy_pending") or "").strip()
+    if pending_delete_strategy and delete_strategy_token > shown_delete_strategy_token:
+        st.session_state.delete_strategy_dialog_shown_token = delete_strategy_token
+        render_delete_strategy_dialog(pending_delete_strategy)
+
+    delete_scrip_token = int(st.session_state.get("delete_scrip_dialog_token", 0) or 0)
+    shown_delete_scrip_token = int(st.session_state.get("delete_scrip_dialog_shown_token", 0) or 0)
+    pending_delete_scrip = st.session_state.get("delete_scrip_pending")
+    if pending_delete_scrip and delete_scrip_token > shown_delete_scrip_token:
+        st.session_state.delete_scrip_dialog_shown_token = delete_scrip_token
+        render_delete_scrip_dialog(str(pending_delete_scrip))
+
+    if st.session_state.get("update_launching"):
+        st.info("Starting software update. The app will close and reopen automatically.")
+        time.sleep(0.8)
+        os._exit(0)
+
+    local_version_info = load_app_version_info(BASE_DIR)
+    update_info = st.session_state.get("update_info")
+    if isinstance(update_info, dict):
+        current_version = str(local_version_info.get("version") or "0.0.0").strip()
+        latest_version = str(update_info.get("version") or "").strip()
+        dismissed_version = str(st.session_state.get("update_prompt_dismissed_version") or "").strip()
+        if latest_version:
+            update_info["current_version"] = current_version
+        if (
+            latest_version
+            and is_newer_version(current_version, latest_version)
+            and dismissed_version != latest_version
+        ):
+            render_software_update_dialog(update_info)
+
     if st.session_state.show_filters:
         with st.sidebar:
-            st.header("Filters")
-            st.caption(f"Timeframe: {TIMEFRAME_TEXT}")
-            st.caption("Session: 09:15 - 15:27")
-            st.markdown("**Google Drive**")
-            if drive_status.connected:
-                if drive_raw_files_error:
-                    st.warning(f"Could not read Drive raw files: {drive_raw_files_error}")
-                elif drive_raw_files:
-                    st.radio(
-                        "Process Raw Files from Google Drive?",
-                        ["No", "Yes"],
-                        horizontal=True,
-                        key="drive_process_choice_widget",
-                        on_change=trigger_drive_process_dialog,
-                        help="Choose Yes when you want to process selected raw scrips from Google Drive.",
-                    )
-                else:
-                    st.caption("No supported raw files found in Google Drive yet.")
-            elif drive_status.configured:
-                st.warning(drive_status.message)
-            else:
-                st.info(drive_status.message)
-            if is_windows:
-                if st.button("Main Folder", width="stretch"):
-                    selected_folder = browse_for_folder(st.session_state.main_dir_path_input)
-                    if selected_folder:
-                        selected_main_dir = resolve_main_workspace_dir(selected_folder)
-                        st.session_state.main_dir_path_input = str(selected_main_dir)
-                        st.session_state.data_dir_path_input = str(selected_main_dir / "Input Files")
-                        st.session_state.output_dir_path_input = str(selected_main_dir / "Output Files")
-                        st.session_state.selected_symbol = None
-                        st.rerun()
-            else:
-                raw_dir, input_dir, output_dir = ensure_workspace_dirs(cloud_workspace_dir)
-                st.session_state.main_dir_path_input = str(cloud_workspace_dir)
-                st.session_state.data_dir_path_input = str(input_dir)
-                st.session_state.output_dir_path_input = str(output_dir)
-                if drive_status.connected and not st.session_state.get("drive_output_sync_completed"):
-                    output_level, output_message, output_count = sync_google_drive_output_files_to_dir(drive_status, output_dir)
-                    if output_level == "error":
-                        st.session_state.process_feedback_level = "error"
-                        st.session_state.process_feedback_message = output_message
-                    else:
-                        st.session_state.drive_output_sync_completed = True
-                        if output_count:
-                            st.session_state.saved_signals = []
-                            st.session_state.saved_signals_symbol = None
-                            st.session_state.saved_signals_output_csv = None
-                            st.session_state.latest_signal = None
-                        list_google_drive_folder_files.clear()
-                        list_symbols.clear()
-                        load_data.clear()
-                        st.rerun()
-                if (
-                    drive_status.connected
-                    and drive_raw_files
-                    and st.session_state.get("drive_process_choice_widget") == "No"
-                    and st.session_state.get("drive_input_sync_choice") != "No"
-                ):
-                    level, message, file_count = sync_google_drive_input_files_to_dir(drive_status, input_dir)
-                    st.session_state.process_feedback_level = level
-                    st.session_state.process_feedback_message = message
-                    st.session_state.drive_input_sync_choice = "No"
-                    st.session_state.drive_input_sync_file_count = file_count
-                    if level != "error":
-                        list_google_drive_folder_files.clear()
-                        list_symbols.clear()
-                        load_data.clear()
-                        st.rerun()
-
-            if is_windows:
-                if st.button("Process Input Files", width="stretch"):
-                    selected_main_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
-                    if not selected_main_raw:
-                        st.session_state.process_feedback_level = "error"
-                        st.session_state.process_feedback_message = "Please select the Main Folder first."
-                        st.rerun()
-
-                    selected_main_dir = resolve_main_workspace_dir(selected_main_raw)
-                    raw_dir = selected_main_dir / "Raw Files"
-                    input_dir = selected_main_dir / "Input Files"
-                    output_dir = selected_main_dir / "Output Files"
-
-                    if not selected_main_dir.exists() or not selected_main_dir.is_dir():
-                        st.session_state.process_feedback_level = "error"
-                        st.session_state.process_feedback_message = f"Main folder not found: {selected_main_dir}"
-                        st.rerun()
-
-                    if not raw_dir.exists():
-                        st.session_state.process_feedback_level = "error"
-                        st.session_state.process_feedback_message = f"Raw Files folder not found in {selected_main_dir}"
-                        st.rerun()
-
-                    if not raw_dir.is_dir():
-                        st.session_state.process_feedback_level = "error"
-                        st.session_state.process_feedback_message = f"Raw Files is not a folder in {selected_main_dir}"
-                        st.rerun()
-
-                    input_dir.mkdir(parents=True, exist_ok=True)
-                    output_dir.mkdir(parents=True, exist_ok=True)
-
-                    summary = process_raw_folder(raw_dir, input_dir)
-                    level, message = build_processing_feedback(summary)
-                    st.session_state.process_feedback_level = level
-                    st.session_state.process_feedback_message = message
-                    st.session_state.data_dir_path_input = str(input_dir)
-                    st.session_state.output_dir_path_input = str(output_dir)
-                    st.session_state.selected_symbol = None
-                    list_symbols.clear()
-                    load_data.clear()
-                    st.rerun()
-
             feedback_level = st.session_state.get("process_feedback_level")
             feedback_message = str(st.session_state.get("process_feedback_message") or "").strip()
             if feedback_level and feedback_message:
@@ -4594,20 +5610,18 @@ def main() -> None:
                 feedback_fn(feedback_message)
                 st.session_state.process_feedback_level = None
                 st.session_state.process_feedback_message = ""
-
-    if st.session_state.get("show_drive_process_dialog"):
-        workspace_dir_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
-        workspace_dir = (
-            resolve_main_workspace_dir(workspace_dir_raw)
-            if workspace_dir_raw
-            else cloud_workspace_dir
-        )
-        render_drive_process_dialog(
-            symbol_names=drive_raw_symbol_names,
-            symbol_files=drive_raw_symbol_files,
-            main_dir=workspace_dir,
-            drive_input_folder_id=drive_status.input_folder.folder_id if drive_status.input_folder else "",
-        )
+            cleanup_feedback_level = st.session_state.get("cleanup_feedback_level")
+            cleanup_feedback_message = str(st.session_state.get("cleanup_feedback_message") or "").strip()
+            if cleanup_feedback_level and cleanup_feedback_message:
+                cleanup_feedback_fn = {
+                    "success": st.success,
+                    "warning": st.warning,
+                    "error": st.error,
+                    "info": st.info,
+                }.get(cleanup_feedback_level, st.info)
+                cleanup_feedback_fn(cleanup_feedback_message)
+                st.session_state.cleanup_feedback_level = None
+                st.session_state.cleanup_feedback_message = ""
 
     main_dir_raw = str(st.session_state.get("main_dir_path_input") or "").strip()
     if not main_dir_raw:
@@ -4648,39 +5662,55 @@ def main() -> None:
         st.error(f"Output folder is not writable: {output_dir}")
         return
 
-    symbols = list_symbols(str(data_dir))
-    if not symbols:
-        raw_symbols = list_supported_data_files(raw_dir)
-        if raw_symbols:
-            if is_windows:
-                st.error("No processed supported data files found in Input Files. Click Process Input Files.")
-            else:
-                st.info("No processed files are available in Google Drive Input Files yet. Choose 'Yes' to process Drive raw files.")
-        else:
-            if drive_status.connected and drive_raw_files:
-                st.info("Google Drive raw files were found. Choose 'Yes' in 'Process Raw Files from Google Drive?' to open the processing popup.")
-            elif is_windows:
-                st.error(f"No raw supported data files found in {raw_dir}")
-            else:
-                st.info("No supported Google Drive raw files were found yet.")
+    unresolved_indicator_requirements = get_unresolved_indicator_requirements(raw_dir, main_dir)
+    if unresolved_indicator_requirements:
+        render_indicator_requirements_dialog(main_dir, unresolved_indicator_requirements)
+        st.warning("Update the indicator requirements first, then the app will process the raw files and load the data.")
         return
 
-    symbol_names = list(symbols.keys())
+    instruments = list_instruments(str(data_dir))
+    if not instruments:
+        raw_symbols = list_supported_data_files(raw_dir)
+        if raw_symbols:
+            st.error("No processed supported data files found in Input Files after auto-processing. Please check the Raw Files format.")
+        else:
+            st.error(f"No raw supported data files found in {raw_dir}")
+        return
+
+    output_cleanup_key = (
+        str(output_dir.resolve()),
+        tuple(sorted(str(item.get("key") or "") for item in instruments)),
+    )
+    if st.session_state.get("output_cleanup_key") != output_cleanup_key:
+        st.session_state.output_cleanup_key = output_cleanup_key
+        try:
+            cleanup_level, cleanup_message = cleanup_workspace_output_files(output_dir, instruments)
+        except Exception as exc:
+            st.session_state.cleanup_feedback_level = "warning"
+            st.session_state.cleanup_feedback_message = f"Cleanup review skipped: {exc}"
+        else:
+            if cleanup_level and cleanup_message:
+                st.session_state.cleanup_feedback_level = cleanup_level
+                st.session_state.cleanup_feedback_message = cleanup_message
+
+    available_symbols = sorted({str(item["symbol"]) for item in instruments})
     requested_symbol_restore = st.session_state.get("selected_symbol_restore")
-    if requested_symbol_restore in symbol_names:
+    if requested_symbol_restore in available_symbols:
         st.session_state.selected_symbol = requested_symbol_restore
     st.session_state.selected_symbol_restore = None
-    if st.session_state.selected_symbol not in symbol_names:
-        st.session_state.selected_symbol = symbol_names[0]
+    if st.session_state.selected_symbol not in available_symbols:
+        st.session_state.selected_symbol = available_symbols[0]
 
+    sidebar_strategy_caption = None
     if st.session_state.show_filters:
         with st.sidebar:
             symbol = st.selectbox(
                 "Select Scrip",
-                symbol_names,
+                available_symbols,
                 key="selected_symbol",
                 format_func=display_symbol,
             )
+            sidebar_strategy_caption = st.empty()
             st.number_input(
                 "Qty",
                 min_value=1,
@@ -4691,25 +5721,135 @@ def main() -> None:
     else:
         symbol = st.selectbox(
             "Select Scrip",
-            symbol_names,
+            available_symbols,
             key="selected_symbol",
             format_func=display_symbol,
         )
 
-    df = load_data(symbols[symbol])
+    symbol_instruments = [item for item in instruments if str(item["symbol"]) == str(symbol)]
+    timeframe_options = [str(item["timeframe_label"]) for item in symbol_instruments]
+    if not timeframe_options:
+        st.error(f"No timeframe data found for {display_symbol(symbol)}.")
+        return
+    if st.session_state.selected_timeframe not in timeframe_options:
+        st.session_state.selected_timeframe = timeframe_options[0]
+    active_timeframe_label = str(st.session_state.selected_timeframe)
+    selected_instrument = next(
+        (
+            item
+            for item in symbol_instruments
+            if str(item["timeframe_label"]) == active_timeframe_label
+        ),
+        symbol_instruments[0],
+    )
+    active_timeframe_label = str(selected_instrument["timeframe_label"])
+    st.session_state.selected_timeframe = active_timeframe_label
 
-    output_csv_path = output_signal_csv_path(output_dir, symbol)
+    instrument_key = str(selected_instrument["key"])
+    signal_storage_stem = resolve_signal_storage_stem(symbol, timeframe_options, instrument_key)
+    exchange_label = str(selected_instrument["exchange"]).upper()
+    selected_identity = InstrumentIdentity(
+        exchange=exchange_label,
+        symbol=str(selected_instrument["symbol"]).upper(),
+        timeframe_value=str(selected_instrument["timeframe_value"]),
+        timeframe_label=active_timeframe_label,
+        storage_stem=instrument_key,
+    )
+    data_file_path = Path(str(selected_instrument["path"]))
+    df = load_data(str(data_file_path))
+    indicator_name_config = get_indicator_display_name_config(main_dir)
+    indicator_groups = apply_indicator_display_names(build_indicator_groups(df), indicator_name_config)
+    indicator_group_keys = [str(group.get("key") or "") for group in indicator_groups if str(group.get("key") or "").strip()]
+    indicator_color_config = get_indicator_color_config(main_dir)
+    indicator_enabled_config = get_indicator_enabled_config(main_dir)
+    indicator_line_width_config = get_indicator_line_width_config(main_dir)
+    indicator_color_defaults: dict[str, str] = {}
+    for group in indicator_groups:
+        indicator_color_defaults.update(
+            {
+                setting_key: indicator_color_config.get(setting_key, default_value)
+                for setting_key, default_value in default_indicator_colors(group).items()
+            }
+        )
+
+    available_strategies = list_strategy_names(output_dir)
+    default_strategy_name = get_default_strategy_name(main_dir)
+    if st.session_state.selected_strategy not in available_strategies:
+        if default_strategy_name in available_strategies:
+            st.session_state.selected_strategy = default_strategy_name
+        else:
+            st.session_state.selected_strategy = available_strategies[0]
+    active_strategy = str(st.session_state.get("selected_strategy") or DEFAULT_STRATEGY_NAME)
+    active_output_dir = strategy_output_dir(output_dir, active_strategy)
+    active_output_dir.mkdir(parents=True, exist_ok=True)
+    if sanitize_strategy_name(active_strategy).casefold() == DEFAULT_STRATEGY_NAME.casefold():
+        current_output_path = find_data_file_by_stem(active_output_dir, signal_storage_stem)
+        if current_output_path is None or not current_output_path.exists() or current_output_path.stat().st_size == 0:
+            strategy_matches = find_existing_strategy_match(output_dir, available_strategies, signal_storage_stem)
+            if len(strategy_matches) == 1:
+                active_strategy, active_output_dir, _ = strategy_matches[0]
+                st.session_state.selected_strategy = active_strategy
+                st.session_state.cleanup_feedback_level = "info"
+                st.session_state.cleanup_feedback_message = (
+                    f"Loaded existing trades for {display_symbol(symbol)} from strategy '{active_strategy}'."
+                )
+            elif len(strategy_matches) > 1:
+                st.session_state.cleanup_feedback_level = "warning"
+                st.session_state.cleanup_feedback_message = (
+                    f"Multiple strategy folders contain saved trades for {display_symbol(symbol)}. "
+                    "Open Edit Settings and choose the correct strategy."
+                )
+    if sidebar_strategy_caption is not None:
+        sidebar_strategy_caption.caption(f"Strategy: {active_strategy}")
+
+    if st.session_state.get("delete_strategy_confirmed"):
+        strategy_to_delete = sanitize_strategy_name(st.session_state.get("delete_strategy_pending"))
+        st.session_state.delete_strategy_confirmed = False
+        st.session_state.delete_strategy_pending = None
+        if strategy_to_delete and strategy_to_delete.casefold() != DEFAULT_STRATEGY_NAME.casefold():
+            target_strategy_dir = strategy_output_dir(output_dir, strategy_to_delete)
+            if target_strategy_dir.exists() and target_strategy_dir.is_dir():
+                shutil.rmtree(target_strategy_dir, ignore_errors=True)
+            updated_config = load_indicator_config(main_dir)
+            if str(updated_config.get("default_strategy") or "").strip().casefold() == strategy_to_delete.casefold():
+                updated_config["default_strategy"] = DEFAULT_STRATEGY_NAME
+                save_indicator_config(main_dir, updated_config)
+            st.session_state.selected_strategy = DEFAULT_STRATEGY_NAME
+            st.rerun()
+
+    if st.session_state.get("delete_scrip_confirmed"):
+        stems_to_delete = build_instrument_delete_stems(symbol, timeframe_options, instrument_key)
+        delete_result = delete_selected_instrument_files(
+            raw_dir=raw_dir,
+            input_dir=data_dir,
+            output_dir=output_dir,
+            selected_identity=selected_identity,
+            stems_to_delete=stems_to_delete,
+        )
+        st.session_state.delete_scrip_confirmed = False
+        st.session_state.delete_scrip_pending = None
+        st.session_state.selected_symbol_restore = None
+        st.session_state.selected_timeframe = None
+        st.session_state.chart_payload_signature = None
+        st.session_state.chart_payload_data = None
+        st.session_state.auto_process_signature = None
+        list_symbols.clear()
+        list_instruments.clear()
+        load_data.clear()
+        st.session_state.process_feedback_level = "success"
+        st.session_state.process_feedback_message = (
+            f"Deleted {display_symbol(symbol)} {active_timeframe_label}. "
+            f"Raw: {delete_result['raw_deleted']}, Input: {delete_result['input_deleted']}, Output: {delete_result['output_deleted']}."
+        )
+        st.rerun()
+
+    output_csv_path = output_signal_csv_path(active_output_dir, signal_storage_stem)
     if (
         st.session_state.get("saved_signals_symbol") != symbol
         or st.session_state.get("saved_signals_output_csv") != str(output_csv_path)
     ):
-        st.session_state.output_reload_feedback_level = None
-        st.session_state.output_reload_feedback_message = ""
-        st.session_state.output_update_feedback_level = None
-        st.session_state.output_update_feedback_message = ""
-        st.session_state.output_update_manual_download = None
         try:
-            ensure_output_signal_file(output_dir, symbol)
+            ensure_output_signal_file(active_output_dir, signal_storage_stem)
             loaded_saved_signals = load_saved_signals_file(output_csv_path, symbol, input_df=df)
             persisted_saved_signals = persist_saved_signals_file(output_csv_path, symbol, loaded_saved_signals)
         except Exception as exc:
@@ -4731,58 +5871,123 @@ def main() -> None:
     if (
         st.session_state.get("filter_symbol") != symbol
         or st.session_state.get("filter_data_dir") != str(data_dir)
-        or st.session_state.get("filter_output_dir") != str(output_dir)
+        or st.session_state.get("filter_output_dir") != str(active_output_dir)
     ):
         st.session_state.filter_symbol = symbol
         st.session_state.filter_data_dir = str(data_dir)
-        st.session_state.filter_output_dir = str(output_dir)
+        st.session_state.filter_output_dir = str(active_output_dir)
         st.session_state.filter_from_date = default_from_date
         st.session_state.filter_to_date = max_date
         st.session_state.chart_window_start = default_from_date
         st.session_state.filter_source_from = default_from_date
         st.session_state.filter_source_to = max_date
+        st.session_state.selected_indicator_keys = [
+            group_key
+            for group_key in indicator_group_keys
+            if indicator_enabled_config.get(group_key, True)
+        ]
+
+    if st.session_state.get("pending_reset_filters"):
+        st.session_state.pending_reset_filters = False
+        st.session_state.filter_from_date = default_from_date
+        st.session_state.filter_to_date = max_date
+        st.session_state.chart_window_start = default_from_date
+        st.session_state.filter_source_from = default_from_date
+        st.session_state.filter_source_to = max_date
+        st.session_state.selected_indicator_keys = [
+            group_key
+            for group_key in indicator_group_keys
+            if indicator_enabled_config.get(group_key, True)
+        ]
+        st.session_state.saved_signals_selected_rows = []
+        reset_clicked_candle()
+        st.session_state.chart_payload_signature = None
+        st.session_state.chart_payload_data = None
 
     st.session_state.setdefault("filter_from_date", default_from_date)
     st.session_state.setdefault("filter_to_date", max_date)
+    st.session_state.selected_indicator_keys = [
+        group_key
+        for group_key in st.session_state.get("selected_indicator_keys", [])
+        if group_key in indicator_group_keys
+    ]
     st.session_state.filter_from_date = min(max(st.session_state.filter_from_date, min_date), max_date)
     st.session_state.filter_to_date = min(max(st.session_state.filter_to_date, min_date), max_date)
     if st.session_state.filter_from_date > st.session_state.filter_to_date:
         st.session_state.filter_to_date = st.session_state.filter_from_date
 
+    if st.session_state.get("edit_settings_open"):
+        render_edit_settings_dialog(
+            main_dir=main_dir,
+            output_dir=output_dir,
+            symbol=symbol,
+            available_symbols=available_symbols,
+            min_date=min_date,
+            max_date=max_date,
+            active_strategy=active_strategy,
+            available_strategies=available_strategies,
+            indicator_groups=indicator_groups,
+            indicator_group_keys=indicator_group_keys,
+            indicator_color_config=indicator_color_config,
+            indicator_enabled_config=indicator_enabled_config,
+            indicator_line_width_config=indicator_line_width_config,
+            active_chart_type=str(st.session_state.get("chart_type") or "Candlestick"),
+            default_from_date=default_from_date,
+            active_timeframe_label=active_timeframe_label,
+            exchange_label=exchange_label,
+        )
+
     if st.session_state.show_filters:
         with st.sidebar:
-            from_date = st.date_input(
-                "From Date",
-                min_value=min_date,
-                max_value=max_date,
-                format="DD/MM/YYYY",
-                key="filter_from_date",
-            )
-            to_date = st.date_input(
-                "To Date",
-                min_value=min_date,
-                max_value=max_date,
-                format="DD/MM/YYYY",
-                key="filter_to_date",
-            )
-            st.markdown("<div style='height: 1.2rem;'></div>", unsafe_allow_html=True)
-            if st.button("See Dashboard", width="stretch", key="open-output-dashboard"):
+            from_date = st.session_state.filter_from_date
+            to_date = st.session_state.filter_to_date
+            if st.button("Edit Settings", width="stretch", key="open-edit-settings-dialog"):
+                st.session_state.edit_settings_open = True
+                st.rerun()
+            if st.button("Trades", width="stretch", key="sidebar-trades-toggle"):
+                st.session_state.show_saved_signals_panel = not st.session_state.show_saved_signals_panel
+                st.rerun()
+            st.markdown("<div style='height: 1.6rem;'></div>", unsafe_allow_html=True)
+            if st.button("Dashboard", width="stretch", key="open-output-dashboard"):
                 render_output_dashboard_dialog(output_dir)
+            if st.button("Sync to Drive", width="stretch", key="sync-trades-to-drive-sidebar"):
+                drive_output_dir_raw = str(st.session_state.get("drive_output_dir_path_input") or "").strip()
+                if not drive_output_dir_raw:
+                    st.error("Drive Output Files path is not configured.")
+                else:
+                    drive_output_dir = Path(drive_output_dir_raw)
+                    drive_main_dir = resolve_main_workspace_dir(drive_output_dir)
+                    drive_raw_dir = drive_main_dir / "Raw Files"
+                    drive_input_dir = drive_main_dir / "Input Files"
+                    drive_root_output_dir = drive_main_dir / "Output Files"
+                    drive_strategy_output_dir = strategy_output_dir(drive_root_output_dir, active_strategy)
+                    if not drive_root_output_dir.exists():
+                        st.error(f"Drive Output Files folder not found: {drive_root_output_dir}")
+                    elif not drive_root_output_dir.is_dir():
+                        st.error(f"Drive Output Files path is not a folder: {drive_root_output_dir}")
+                    else:
+                        try:
+                            drive_strategy_output_dir.mkdir(parents=True, exist_ok=True)
+                            raw_synced_count = sync_raw_files_to_drive(raw_dir, drive_raw_dir, selected_identity)
+                            drive_input_path, input_row_count = sync_input_file_to_drive(data_dir, drive_input_dir, instrument_key)
+                            drive_csv_path, merged_signals, merged_count = sync_saved_signals_to_drive(
+                                output_csv_path,
+                                drive_strategy_output_dir,
+                                symbol,
+                                signal_storage_stem,
+                                input_df=df,
+                            )
+                        except Exception as exc:
+                            st.error(f"Could not sync trades to drive: {exc}")
+                        else:
+                            st.success(
+                                f"Synced {display_symbol(symbol)}. Raw files: {raw_synced_count}, "
+                                f"Input rows: {input_row_count}, Trades: {merged_count}."
+                            )
+                            apply_saved_signals_state(merged_signals, symbol, output_csv_path)
     else:
-        from_date = st.date_input(
-            "From Date",
-            min_value=min_date,
-            max_value=max_date,
-            format="DD/MM/YYYY",
-            key="filter_from_date",
-        )
-        to_date = st.date_input(
-            "To Date",
-            min_value=min_date,
-            max_value=max_date,
-            format="DD/MM/YYYY",
-            key="filter_to_date",
-        )
+        from_date = st.session_state.filter_from_date
+        to_date = st.session_state.filter_to_date
 
     requested_from_date = from_date
     requested_to_date = to_date
@@ -4797,53 +6002,114 @@ def main() -> None:
         st.session_state.filter_source_to = requested_to_date
 
     from_date = max(min_date, st.session_state.chart_window_start)
-    to_date = min(max_date, compute_chart_window_end(from_date, requested_to_date))
+    navigation_limit_date = min(max_date, requested_to_date)
+    to_date = compute_chart_window_end(df, from_date, navigation_limit_date)
 
     if from_date > to_date:
         st.error("From Date cannot be after To Date.")
         return
 
-    chart_df, candle_data, was_limited = prepare_candle_data(df, from_date, to_date)
+    chart_df, candle_data, indicator_data, was_limited = get_chart_payload(
+        df,
+        data_file_path,
+        from_date,
+        to_date,
+        indicator_groups=indicator_groups,
+        indicator_color_config=get_indicator_color_config(main_dir),
+        indicator_line_width_config=get_indicator_line_width_config(main_dir),
+    )
     if chart_df.empty:
         st.warning("No candles available for the selected date range.")
         return
 
     sync_clicked_candle_with_view(chart_df)
-    ema_data = prepare_ema_data(chart_df)
+    active_indicator_keys = set(st.session_state.get("selected_indicator_keys", []))
+    active_indicator_data = [
+        item
+        for item in indicator_data
+        if str(item.get("groupKey") or "") in active_indicator_keys
+    ]
 
     latest_row = chart_df.iloc[-1]
-    range_start = from_date
-    range_end = to_date
+    range_start = pd.Timestamp(chart_df["Timestamp"].iloc[0]).date()
+    range_end = pd.Timestamp(chart_df["Timestamp"].iloc[-1]).date()
     range_label = f"{pd.to_datetime(range_start):%d-%b-%Y} to {pd.to_datetime(range_end):%d-%b-%Y}"
-    navigation_limit_date = min(max_date, requested_to_date)
-    next_from_date = to_date
-    next_to_date = min(max_date, compute_chart_window_end(next_from_date, navigation_limit_date))
+    previous_limit_date = min(
+        navigation_limit_date,
+        (pd.Timestamp(range_start) + pd.Timedelta(days=2)).date(),
+    )
+    previous_window_df = df.loc[
+        (df["Timestamp"].dt.date >= requested_from_date)
+        & (df["Timestamp"].dt.date < range_start),
+        ["Timestamp"],
+    ]
+    has_previous_window = not previous_window_df.empty
+    previous_from_date = (
+        compute_chart_window_start(df, requested_from_date, previous_limit_date)
+        if has_previous_window
+        else requested_from_date
+    )
+    next_from_date = max(
+        min_date,
+        (pd.Timestamp(range_end) - pd.Timedelta(days=2)).date(),
+    )
+    next_window_df = df.loc[
+        (df["Timestamp"].dt.date > range_end)
+        & (df["Timestamp"].dt.date <= navigation_limit_date),
+        ["Timestamp"],
+    ]
+    has_next_window = not next_window_df.empty
+    next_to_date = (
+        compute_chart_window_end(df, next_from_date, navigation_limit_date)
+        if has_next_window
+        else navigation_limit_date
+    )
 
     col_left, col_center, col_right = st.columns([1.8, 2, 4.2], gap="small")
     with col_left:
         header_left_placeholder = st.empty()
     with col_center:
         st.markdown("<div class='header-spacer'></div>", unsafe_allow_html=True)
-        btn_left, btn_mid, btn_right = st.columns([0.05, 1.9, 1.9], gap="small")
+        if len(timeframe_options) > 1:
+            timeframe_cols = st.columns(len(timeframe_options), gap="small")
+            for idx, timeframe_label in enumerate(timeframe_options):
+                with timeframe_cols[idx]:
+                    if st.button(
+                        timeframe_label,
+                        key=f"timeframe-select-{symbol}-{timeframe_label}",
+                        type="primary" if timeframe_label == active_timeframe_label else "secondary",
+                        width="stretch",
+                    ):
+                        st.session_state.selected_timeframe = timeframe_label
+                        clear_chart_selection()
+                        st.rerun()
+        else:
+            st.markdown(
+                f"<div style='text-align:center; margin-bottom:0.35rem;'><span class='tf-pill-single'>{active_timeframe_label}</span></div>",
+                unsafe_allow_html=True,
+            )
+        btn_left, btn_right = st.columns(2, gap="small")
         with btn_left:
-            st.empty()
-        with btn_mid:
-            next_month_clicked = st.button(
-                "Next Month",
+            previous_clicked = st.button(
+                "Prev",
                 width="stretch",
-                key="header-next-month",
+                key="header-prev-window",
+                disabled=not has_previous_window,
             )
         with btn_right:
-            trades_clicked = st.button(
-                "Trades",
+            next_clicked = st.button(
+                "Next",
                 width="stretch",
-                key="header-trades-toggle",
+                key="header-next-window",
+                disabled=not has_next_window,
             )
-        if next_month_clicked and next_from_date < navigation_limit_date and next_to_date > next_from_date:
-            st.session_state.chart_window_start = next_from_date
+        if previous_clicked and has_previous_window and previous_limit_date >= previous_from_date:
+            clear_chart_selection()
+            st.session_state.chart_window_start = previous_from_date
             st.rerun()
-        if trades_clicked:
-            st.session_state.show_saved_signals_panel = not st.session_state.show_saved_signals_panel
+        if next_clicked and has_next_window and next_to_date >= next_from_date:
+            clear_chart_selection()
+            st.session_state.chart_window_start = next_from_date
             st.rerun()
     with col_right:
         header_right_placeholder = st.empty()
@@ -4868,28 +6134,44 @@ def main() -> None:
         build_signature = "dev"
     st.session_state.build_signature = build_signature
 
+    if st.session_state.get("remove_trade_confirmed") and st.session_state.get("remove_trade_pending"):
+        remove_signal(st.session_state.remove_trade_pending, output_csv_path)
+        st.session_state.remove_trade_pending = None
+        st.session_state.remove_trade_confirmed = False
+        st.session_state.last_chart_click_token = None
+        st.session_state.last_chart_click_at = 0.0
+        st.session_state.skip_next_chart_event = True
+        st.session_state.chart_reset_nonce = int(st.session_state.get("chart_reset_nonce", 0) or 0) + 1
+        st.rerun()
+
     with chart_col:
         chart_event = tv_chart_component(
             candles=candle_data,
-            ema=ema_data,
+            indicators=active_indicator_data,
             markers=build_markers(symbol),
-            replayState=normalize_chart_replay_state(st.session_state.get("chart_replay_state")),
+            chartType=str(st.session_state.get("chart_type") or "Candlestick"),
             key=f"tv-lite-{symbol}-{st.session_state.chart_reset_nonce}-{build_signature}",
             height=CHART_HEIGHT,
         )
 
     # --- CHART CLICK LOGIC ---
     if chart_event:
+        if st.session_state.get("skip_next_chart_event"):
+            st.session_state.skip_next_chart_event = False
+            chart_event = None
+    if chart_event:
         chart_event_type = chart_event.get("eventType") if isinstance(chart_event, dict) else None
 
         if isinstance(chart_event, dict):
             if "zoomed" in chart_event:
                 st.session_state.chart_zoomed = bool(chart_event.get("zoomed"))
-            if "replayState" in chart_event:
-                st.session_state.chart_replay_state = normalize_chart_replay_state(
-                    chart_event.get("replayState")
-                )
-        clicked_row = parse_clicked_row(chart_event, chart_df)
+        if chart_event_type == "view_reset":
+            clear_chart_selection()
+        clicked_row = (
+            parse_clicked_row(chart_event, chart_df)
+            if chart_event_type in {"chart_click", "chart_double_click"}
+            else None
+        )
 
         if clicked_row is not None:
             st.session_state.clicked_date = clicked_row["DateLabel"]
@@ -4923,8 +6205,11 @@ def main() -> None:
                 and (now_monotonic - previous_at) <= 0.8
             )
 
-            if chart_event_type == "chart_double_click" or repeated_quick_click:
-                remove_signal(signal_record, output_csv_path)
+            if signal_exists:
+                st.session_state.remove_trade_pending = signal_record
+                st.session_state.remove_trade_confirmed = False
+                next_remove_token = int(st.session_state.get("remove_trade_dialog_token", 0) or 0) + 1
+                st.session_state.remove_trade_dialog_token = next_remove_token
                 st.session_state.last_chart_click_token = None
                 st.session_state.last_chart_click_at = 0.0
             else:
@@ -4946,7 +6231,7 @@ def main() -> None:
     header_left_placeholder.markdown(
         (
             "<div class='header-title-line'>"
-            f"<span class='tv-title'>{display_symbol(symbol)} · {TIMEFRAME_LABEL} · NSE</span>"
+            f"<span class='tv-title'>{display_symbol(symbol)} · {active_timeframe_label} · {exchange_label}</span>"
             f"<span class='header-range-inline'>{range_label}</span>"
             "</div>"
         ),
@@ -4957,10 +6242,10 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    # Saved Signals panel moved to the right column.
+    # Trades panel rendered in the right column.
     if table_col is not None:
         with table_col:
-            st.markdown("**Saved Signals**")
+            st.markdown("**Trades**")
             if st.session_state.saved_signals:
                 saved_view = build_saved_signals_trade_table(
                     st.session_state.saved_signals,
@@ -5018,7 +6303,7 @@ def main() -> None:
                 selection = st.dataframe(
                     style_saved_signals_table(saved_view, selected_rows=selected_rows),
                     width="stretch",
-                    height=_table_height_for_rows(len(saved_view)),
+                    height=max(CHART_HEIGHT, _table_height_for_rows(len(saved_view), min_height=320, max_height=CHART_HEIGHT)),
                     hide_index=True,
                     on_select=_sync_saved_signals_selection,
                     selection_mode="multi-cell",
@@ -5026,73 +6311,7 @@ def main() -> None:
                     column_order=saved_column_order,
                 )
             else:
-                st.caption("Click a candle to automatically create BUY or SELL signal.")
-
-            st.markdown("**Reload Data**")
-            if st.button("Reload Data", width="stretch", key="reload-output-data"):
-                try:
-                    reload_level, reload_message, persisted_saved_signals = reload_selected_drive_output_for_symbol(
-                        drive_status=drive_status,
-                        symbol=symbol,
-                        output_dir=output_dir,
-                        input_df=df,
-                    )
-                except Exception as exc:
-                    reload_level = "error"
-                    reload_message = f"Could not reload Google Drive Output data for {display_symbol(symbol)}: {exc}"
-                    persisted_saved_signals = None
-                st.session_state.output_reload_feedback_level = reload_level
-                st.session_state.output_reload_feedback_message = reload_message
-                if persisted_saved_signals is not None:
-                    st.session_state.selected_symbol_restore = symbol
-                    apply_saved_signals_state(persisted_saved_signals, symbol, output_csv_path)
-                    st.session_state.confirm_clear_all = False
-                    st.rerun()
-            reload_feedback_level = st.session_state.get("output_reload_feedback_level")
-            reload_feedback_message = str(st.session_state.get("output_reload_feedback_message") or "").strip()
-            if reload_feedback_level and reload_feedback_message:
-                reload_feedback_fn = {
-                    "success": st.success,
-                    "warning": st.warning,
-                    "error": st.error,
-                }.get(reload_feedback_level, st.info)
-                reload_feedback_fn(reload_feedback_message)
-
-            st.markdown("**Update Data**")
-            if st.button("Update Data", width="stretch", key="update-trade-data"):
-                level, message, manual_download = update_trade_data_in_google_drive(
-                    drive_status=drive_status,
-                    symbol=symbol,
-                    trade_data_bytes=trade_download_bytes,
-                )
-                st.session_state.output_update_feedback_level = level
-                st.session_state.output_update_feedback_message = message
-                st.session_state.output_update_manual_download = manual_download
-                if level == "success":
-                    st.session_state.drive_output_sync_completed = False
-                    list_google_drive_folder_files.clear()
-            output_feedback_level = st.session_state.get("output_update_feedback_level")
-            output_feedback_message = str(st.session_state.get("output_update_feedback_message") or "").strip()
-            if output_feedback_level and output_feedback_message:
-                feedback_fn = {
-                    "success": st.success,
-                    "warning": st.warning,
-                    "error": st.error,
-                }.get(output_feedback_level, st.info)
-                feedback_fn(output_feedback_message)
-            output_manual_download = st.session_state.get("output_update_manual_download")
-            if isinstance(output_manual_download, dict):
-                file_name = str(output_manual_download.get("file_name") or f"{symbol}.csv")
-                file_bytes = output_manual_download.get("data") or b""
-                mime_type = str(output_manual_download.get("mime") or "text/csv")
-                st.download_button(
-                    f"Download {file_name}",
-                    data=file_bytes,
-                    file_name=file_name,
-                    mime=mime_type,
-                    width="stretch",
-                    key=f"download-missing-output-{file_name}",
-                )
+                st.caption("Click a candle to automatically create a BUY or SELL trade.")
 
 if __name__ == "__main__":
     main()

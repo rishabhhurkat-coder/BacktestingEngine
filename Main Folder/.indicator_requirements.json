@@ -1,0 +1,32 @@
+{
+  "column_labels": {
+    "EMA": "EMA 100",
+    "EMA.1": "EMA 200",
+    "Up Trend": "Super Trend UP",
+    "Down Trend": "Super Trend DN"
+  },
+  "indicator_colors": {
+    "Super Trend Bull": "#2dd61d",
+    "Super Trend Bear": "#c51421",
+    "EMA 100": "#000000",
+    "EMA 200": "#2525dc",
+    "ema": "#e40e1c",
+    "VWAP": "#6d02ec"
+  },
+  "indicator_display_names": {
+    "EMA 100": "EMA 1000",
+    "ema": "EMA 1000",
+    "VWAP": "VWAP Quarterly"
+  },
+  "indicator_enabled": {
+    "super-trend": true,
+    "EMA 100": true,
+    "EMA 200": true,
+    "ema": true,
+    "VWAP": true
+  },
+  "indicator_line_widths": {
+    "VWAP": 1
+  },
+  "default_strategy": "3 Min Individual Trades"
+}

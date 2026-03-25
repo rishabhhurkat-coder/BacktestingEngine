@@ -1,35 +1,31 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { withStreamlitConnection } from "streamlit-component-lib";
-import Chart, { Candle, EmaPoint, Marker } from "./Chart";
+import Chart, { Candle, IndicatorSeries, Marker } from "./Chart";
 
 type StreamlitArgs = {
   candles?: Candle[];
-  ema?: EmaPoint[];
+  indicators?: IndicatorSeries[];
   markers?: Marker[];
+  chartType?: "Candlestick" | "Line Chart";
   height?: number;
-  replayState?: {
-    active?: boolean;
-    index?: number | null;
-    showStartLine?: boolean;
-  } | null;
 };
 
 const App = (props: any): React.ReactElement => {
   const args = (props?.args ?? {}) as StreamlitArgs;
   const candles = args.candles ?? [];
-  const ema = args.ema ?? [];
+  const indicators = args.indicators ?? [];
   const markers = args.markers ?? [];
+  const chartType = args.chartType ?? "Candlestick";
   const height = args.height ?? 600;
-  const replayState = args.replayState ?? null;
 
   return (
     <Chart
       candles={candles}
-      ema={ema}
+      indicators={indicators}
       markers={markers}
+      chartType={chartType}
       height={height}
-      replayState={replayState}
     />
   );
 };

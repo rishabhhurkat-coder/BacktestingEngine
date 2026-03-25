@@ -1,8 +1,7 @@
 .venv/
-Main Folder/
-archive/generated/
-archive/sample-data/Final Files/
 __pycache__/
-.codex-streamlit-home/
+*.py[cod]
+dist/
 tv_chart_component/frontend/node_modules/
-.streamlit/secrets.toml
+tv_chart_component/frontend/build/static/js/*.map
+*.log

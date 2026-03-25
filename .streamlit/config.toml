@@ -8,3 +8,8 @@ font = "sans serif"
 
 [browser]
 gatherUsageStats = false
+
+[server]
+headless = true
+address = "localhost"
+port = 8501

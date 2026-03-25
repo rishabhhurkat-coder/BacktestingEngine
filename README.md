@@ -1,59 +1,51 @@
-# EMA 200 Trades
+# EMA 200 Trades - Local
 
-Streamlit app for cleaning raw 3-minute CSV files, viewing EMA charts, and saving trade signals directly into per-scrip CSV files.
+Local-only Streamlit app for cleaning raw 3-minute CSV files, viewing EMA charts, and saving trade signals into local files.
 
-## Clean Repo Layout
+## What Is Included
 
-```text
-EMA 200 TRADES
-├── streamlit_app.py
-├── data_pipeline.py
-├── component.py
-├── requirements.txt
-├── README.md
-├── scripts/
-├── snapshots/
-├── tv_chart_component/
-└── workspace_template/
-```
+- Local app entry point: `streamlit_app.py`
+- Main application logic: `app/main.py`
+- Built TV chart component: `tv_chart_component/frontend/build`
+- Local workspace: `Main Folder`
+- Local Streamlit config: `.streamlit/`
 
-## Working Folder Layout
-
-Create or select a main working folder with this structure:
+## Main Folder Layout
 
 ```text
 Main Folder
-├── Raw Files
-├── Input Files
-└── Output Files
+|-- Raw Files
+|-- Input Files
+`-- Output Files
 ```
 
 - `Raw Files`: downloaded raw CSV fragments
 - `Input Files`: cleaned merged chart-ready CSVs
 - `Output Files`: saved signal CSVs used by the app
 
-## App Flow
+## Local-Only Behavior
 
-1. Click `Main Folder` and select your working folder.
-2. Click `Process Input Files` to clean and merge files from `Raw Files` into `Input Files`.
-3. Select a scrip.
-4. Click chart candles to save BUY or SELL signals.
-5. Saved signals update directly in the matching CSV inside `Output Files`.
-
-## Notes
-
-- `workspace_template/` is included as a clean starter structure for GitHub.
-- Legacy helper scripts are stored in `archive/legacy/`.
-- The `SALONILOCK` restore snapshot is stored in `snapshots/streamlit_app.SALONILOCK.py`.
+- This copy is intended to run on your computer only.
+- Streamlit is configured to bind to `localhost` only.
+- No Git or GitHub setup is required for this folder.
+- All data stays in the local `Main Folder`.
 
 ## Run
 
-```bash
-streamlit run streamlit_app.py
-```
-
-Or use:
+Use either:
 
 ```bash
 python scripts/launch_streamlit.py
+```
+
+or:
+
+```text
+scripts\Open EMA Viewer.bat
+```
+
+Then open:
+
+```text
+http://localhost:8501
 ```
