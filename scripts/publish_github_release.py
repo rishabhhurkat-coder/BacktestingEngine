@@ -13,8 +13,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VERSION_PATH = ROOT / "app_version.json"
 PACKAGE_PATH = ROOT / "dist" / "EMA-200-Trades-Local-package.zip"
+INSTALLER_PATH = ROOT / "EMA 200 Trades - Local Installer.cmd"
 GIT_EXE = Path(r"C:\Program Files\Git\cmd\git.exe")
 BUILD_SCRIPT = ROOT / "scripts" / "build_release_package.py"
+INSTALLER_BUILD_SCRIPT = ROOT / "scripts" / "build_single_file_installer.py"
 
 
 def load_version_payload() -> dict:
@@ -92,12 +94,12 @@ def delete_existing_asset(repo: str, release: dict, asset_name: str, token: str)
         )
 
 
-def upload_asset(release: dict, package_path: Path, token: str) -> None:
+def upload_asset(release: dict, asset_path: Path, token: str) -> None:
     upload_url_template = str(release.get("upload_url") or "").strip()
     upload_url = upload_url_template.split("{", 1)[0]
-    content_type = mimetypes.guess_type(package_path.name)[0] or "application/zip"
-    params = urllib.parse.urlencode({"name": package_path.name})
-    with package_path.open("rb") as source:
+    content_type = mimetypes.guess_type(asset_path.name)[0] or "application/octet-stream"
+    params = urllib.parse.urlencode({"name": asset_path.name})
+    with asset_path.open("rb") as source:
         github_request_raw(
             f"{upload_url}?{params}",
             token,
@@ -119,14 +121,17 @@ def main() -> None:
         raise SystemExit("Git is not installed at the expected path.")
 
     subprocess.run([sys.executable, str(BUILD_SCRIPT)], cwd=ROOT, check=True)
+    subprocess.run([sys.executable, str(INSTALLER_BUILD_SCRIPT)], cwd=ROOT, check=True)
 
     if not PACKAGE_PATH.exists():
         raise SystemExit(f"Package not found: {PACKAGE_PATH}")
+    if not INSTALLER_PATH.exists():
+        raise SystemExit(f"Installer not found: {INSTALLER_PATH}")
 
     payload = load_version_payload()
     github_config = payload.get("github") if isinstance(payload.get("github"), dict) else {}
     repo = str(github_config.get("repo") or "").strip()
-    asset_name = str(github_config.get("release_asset_name") or PACKAGE_PATH.name).strip()
+    package_asset_name = str(github_config.get("release_asset_name") or PACKAGE_PATH.name).strip()
     version = str(payload.get("version") or "").strip()
     tag_name = f"v{version}"
 
@@ -134,10 +139,12 @@ def main() -> None:
         raise SystemExit("Repository or version info is missing.")
 
     release = ensure_release(repo, tag_name, token)
-    delete_existing_asset(repo, release, asset_name, token)
+    delete_existing_asset(repo, release, package_asset_name, token)
+    delete_existing_asset(repo, release, INSTALLER_PATH.name, token)
     refreshed_release = ensure_release(repo, tag_name, token)
     upload_asset(refreshed_release, PACKAGE_PATH, token)
-    print(f"Published {asset_name} to {repo} release {tag_name}")
+    upload_asset(refreshed_release, INSTALLER_PATH, token)
+    print(f"Published {package_asset_name} and {INSTALLER_PATH.name} to {repo} release {tag_name}")
 
 
 if __name__ == "__main__":

@@ -20,11 +20,13 @@ exit /b %errorlevel%
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
 
 $AppName = 'EMA 200 Trades - Local'
 $GithubRepo = 'rishabhhurkat-coder/BacktestingEngine'
 $ReleaseAssetName = 'EMA-200-Trades-Local-package.zip'
 $InstallerSource = $env:INSTALLER_SELF
+$InstallerDir = if ($InstallerSource) { Split-Path -Parent $InstallerSource } else { '' }
 $InstallerDrive = if ($InstallerSource) { Split-Path -Qualifier $InstallerSource } else { '' }
 $TargetRoot = if ($InstallerDrive -and (Test-Path $InstallerDrive)) { $InstallerDrive } elseif (Test-Path 'D:\') { 'D:\' } else { $env:SystemDrive + '\' }
 $InstallDir = Join-Path $TargetRoot $AppName
@@ -33,6 +35,7 @@ $ShortcutPath = Join-Path $DesktopDir ($AppName + '.lnk')
 $TempDir = Join-Path ([IO.Path]::GetTempPath()) ('ema200-bootstrap-' + [Guid]::NewGuid().ToString('N'))
 $ZipPath = Join-Path $TempDir 'package.zip'
 $ExtractDir = Join-Path $TempDir 'extract'
+$RequirementsHashPath = Join-Path $InstallDir '.requirements.sha256'
 
 $Form = New-Object System.Windows.Forms.Form
 $Form.Text = 'Installing EMA 200 Trades - Local'
@@ -42,6 +45,7 @@ $Form.FormBorderStyle = 'FixedDialog'
 $Form.MaximizeBox = $false
 $Form.MinimizeBox = $false
 $Form.TopMost = $true
+$Form.ShowInTaskbar = $true
 
 $TitleLabel = New-Object System.Windows.Forms.Label
 $TitleLabel.Text = 'EMA 200 Trades - Local'
@@ -78,6 +82,7 @@ function Update-Ui([int]$Percent, [string]$Status, [string]$Detail = '') {
     $StatusLabel.Text = $Status
     $DetailLabel.Text = $Detail
     $Form.Refresh()
+    [System.Windows.Forms.Application]::DoEvents()
 }
 
 function Get-PythonCommand {
@@ -130,6 +135,23 @@ function Get-LatestReleaseAsset {
     return $asset.browser_download_url
 }
 
+function Get-LocalPackageAsset {
+    $candidates = @(
+        $(if ($InstallerDir) { Join-Path $InstallerDir $ReleaseAssetName } else { $null }),
+        (Join-Path $InstallDir ('dist\' + $ReleaseAssetName)),
+        ('D:\EMA 200 Trades - Local\dist\' + $ReleaseAssetName)
+    ) | Where-Object { $_ -and (Test-Path $_) }
+
+    return $candidates | Select-Object -First 1
+}
+
+function Get-FileSha256([string]$PathValue) {
+    if (-not (Test-Path $PathValue)) {
+        return ''
+    }
+    return (Get-FileHash -Algorithm SHA256 -LiteralPath $PathValue).Hash.ToLowerInvariant()
+}
+
 function Download-ReleaseAsset([string]$AssetUrl, [string]$DestinationPath) {
     Update-Ui 15 'Downloading package...' $ReleaseAssetName
     $request = [System.Net.HttpWebRequest]::Create($AssetUrl)
@@ -146,7 +168,7 @@ function Download-ReleaseAsset([string]$AssetUrl, [string]$DestinationPath) {
             $readTotal += $read
             if ($totalBytes -gt 0) {
                 $percent = 15 + [int](($readTotal / $totalBytes) * 30)
-                Update-Ui $percent 'Downloading package...' ("0 KB / 1 KB" -f [int]($readTotal / 1KB), [int]($totalBytes / 1KB))
+                Update-Ui $percent 'Downloading package...' ("{0} KB / {1} KB" -f [int]($readTotal / 1KB), [int]($totalBytes / 1KB))
             }
         }
     } finally {
@@ -169,14 +191,61 @@ function New-DesktopShortcut([string]$InstallDir) {
     $shortcut.Save()
 }
 
+function Sync-PythonDependencies([string[]]$PythonCmd) {
+    $requirementsPath = Join-Path $InstallDir 'requirements.txt'
+    if (-not (Test-Path $requirementsPath)) {
+        return
+    }
+
+    $venvPython = Join-Path $InstallDir '.venv\Scripts\python.exe'
+    $requirementsHash = Get-FileSha256 $requirementsPath
+    $previousHash = if (Test-Path $RequirementsHashPath) { Get-Content -LiteralPath $RequirementsHashPath -ErrorAction SilentlyContinue | Select-Object -First 1 } else { '' }
+
+    if ((-not (Test-Path $venvPython)) -and $PythonCmd) {
+        Update-Ui 68 'Creating virtual environment...' ''
+        $pythonArgs = @()
+        if ($PythonCmd.Length -gt 1) {
+            $pythonArgs = $PythonCmd[1..($PythonCmd.Length - 1)]
+        }
+        & $PythonCmd[0] @($pythonArgs + @('-m', 'venv', (Join-Path $InstallDir '.venv'))) | Out-Null
+    }
+
+    if (-not (Test-Path $venvPython)) {
+        throw 'Virtual environment creation failed.'
+    }
+
+    if ($requirementsHash -and $previousHash -and ($requirementsHash -eq $previousHash)) {
+        Update-Ui 84 'Using existing Python packages...' 'requirements unchanged'
+        return
+    }
+
+    Update-Ui 80 'Installing Python packages...' 'requirements.txt'
+    & $venvPython -m pip install --upgrade pip | Out-Null
+    & $venvPython -m pip install -r $requirementsPath | Out-Null
+    if ($requirementsHash) {
+        Set-Content -LiteralPath $RequirementsHashPath -Value $requirementsHash -Encoding utf8
+    }
+}
+
 $installFailed = $false
 try {
+    $Form.Show()
+    [System.Windows.Forms.Application]::DoEvents()
     Update-Ui 2 'Preparing installer...' $TargetRoot
     New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
     New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
 
-    $assetUrl = Get-LatestReleaseAsset
-    Download-ReleaseAsset -AssetUrl $assetUrl -DestinationPath $ZipPath
+    $localPackage = Get-LocalPackageAsset
+    if ($localPackage) {
+        Update-Ui 15 'Using local package...' (Split-Path -Leaf $localPackage)
+        Copy-Item -LiteralPath $localPackage -Destination $ZipPath -Force
+    } else {
+        $assetUrl = Get-LatestReleaseAsset
+        Download-ReleaseAsset -AssetUrl $assetUrl -DestinationPath $ZipPath
+    }
+    $cacheDir = Join-Path $InstallDir 'dist'
+    New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
+    Copy-Item -LiteralPath $ZipPath -Destination (Join-Path $cacheDir $ReleaseAssetName) -Force
 
     Update-Ui 48 'Extracting package...' $ReleaseAssetName
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
@@ -193,21 +262,7 @@ try {
 
     Update-Ui 58 'Finding Python...' ''
     $pythonCmd = Ensure-PythonInstalled
-    $pythonArgs = @()
-    if ($pythonCmd.Length -gt 1) {
-        $pythonArgs = $pythonCmd[1..($pythonCmd.Length - 1)]
-    }
-
-    Update-Ui 68 'Creating virtual environment...' ''
-    & $pythonCmd[0] @($pythonArgs + @('-m', 'venv', (Join-Path $InstallDir '.venv'))) | Out-Null
-    $venvPython = Join-Path $InstallDir '.venv\Scripts\python.exe'
-    if (-not (Test-Path $venvPython)) {
-        throw 'Virtual environment creation failed.'
-    }
-
-    Update-Ui 80 'Installing Python packages...' 'requirements.txt'
-    & $venvPython -m pip install --upgrade pip | Out-Null
-    & $venvPython -m pip install -r (Join-Path $InstallDir 'requirements.txt') | Out-Null
+    Sync-PythonDependencies -PythonCmd $pythonCmd
 
     Update-Ui 94 'Creating desktop shortcut...' $ShortcutPath
     New-DesktopShortcut -InstallDir $InstallDir
