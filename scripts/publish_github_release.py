@@ -7,13 +7,15 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION_PATH = ROOT / "app_version.json"
 PACKAGE_PATH = ROOT / "dist" / "EMA-200-Trades-Local-package.zip"
-INSTALLER_PATH = ROOT / "EMA 200 Trades - Local Installer.cmd"
+INSTALLER_PATH = ROOT / "BackTestingEngine Installer.cmd"
+INSTALLER_ZIP_PATH = ROOT / "dist" / "EMA-200-Trades-Local-Installer.zip"
 GIT_EXE = Path(r"C:\Program Files\Git\cmd\git.exe")
 BUILD_SCRIPT = ROOT / "scripts" / "build_release_package.py"
 INSTALLER_BUILD_SCRIPT = ROOT / "scripts" / "build_single_file_installer.py"
@@ -112,6 +114,12 @@ def upload_asset(release: dict, asset_path: Path, token: str) -> None:
         )
 
 
+def build_installer_zip() -> None:
+    INSTALLER_ZIP_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(INSTALLER_ZIP_PATH, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        archive.write(INSTALLER_PATH, INSTALLER_PATH.name)
+
+
 def main() -> None:
     token = str(os.environ.get("GITHUB_TOKEN") or "").strip()
     if not token:
@@ -122,11 +130,14 @@ def main() -> None:
 
     subprocess.run([sys.executable, str(BUILD_SCRIPT)], cwd=ROOT, check=True)
     subprocess.run([sys.executable, str(INSTALLER_BUILD_SCRIPT)], cwd=ROOT, check=True)
+    build_installer_zip()
 
     if not PACKAGE_PATH.exists():
         raise SystemExit(f"Package not found: {PACKAGE_PATH}")
     if not INSTALLER_PATH.exists():
         raise SystemExit(f"Installer not found: {INSTALLER_PATH}")
+    if not INSTALLER_ZIP_PATH.exists():
+        raise SystemExit(f"Installer zip not found: {INSTALLER_ZIP_PATH}")
 
     payload = load_version_payload()
     github_config = payload.get("github") if isinstance(payload.get("github"), dict) else {}
@@ -141,10 +152,15 @@ def main() -> None:
     release = ensure_release(repo, tag_name, token)
     delete_existing_asset(repo, release, package_asset_name, token)
     delete_existing_asset(repo, release, INSTALLER_PATH.name, token)
+    delete_existing_asset(repo, release, INSTALLER_ZIP_PATH.name, token)
     refreshed_release = ensure_release(repo, tag_name, token)
     upload_asset(refreshed_release, PACKAGE_PATH, token)
     upload_asset(refreshed_release, INSTALLER_PATH, token)
-    print(f"Published {package_asset_name} and {INSTALLER_PATH.name} to {repo} release {tag_name}")
+    upload_asset(refreshed_release, INSTALLER_ZIP_PATH, token)
+    print(
+        f"Published {package_asset_name}, {INSTALLER_PATH.name}, and {INSTALLER_ZIP_PATH.name} "
+        f"to {repo} release {tag_name}"
+    )
 
 
 if __name__ == "__main__":

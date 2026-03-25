@@ -1,20 +1,4 @@
-from __future__ import annotations
-
-import json
-from pathlib import Path
-
-
-ROOT = Path(__file__).resolve().parent.parent
-INSTALLER_PATH = ROOT / "BackTestingEngine Installer.cmd"
-VERSION_PATH = ROOT / "app_version.json"
-
-
-def load_version_payload() -> dict:
-    return json.loads(VERSION_PATH.read_text(encoding="utf-8"))
-
-
-def build_installer_text(repo: str, release_asset_name: str) -> str:
-    return rf"""<# : batch
+<# : batch
 @echo off
 setlocal
 set "INSTALLER_SELF=%~f0"
@@ -22,7 +6,7 @@ powershell -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -Command ^
  "$self = '%~f0'; " ^
  "$lines = Get-Content -LiteralPath $self; " ^
  "$marker = [Array]::IndexOf($lines, '#<POWERSHELL>#'); " ^
- "if ($marker -lt 0) {{ throw 'Installer payload marker not found.' }}; " ^
+ "if ($marker -lt 0) { throw 'Installer payload marker not found.' }; " ^
  "$script = ($lines[($marker + 1)..($lines.Length - 1)] -join [Environment]::NewLine); " ^
  "$tempScript = Join-Path $env:TEMP ('ema200-bootstrap-' + [Guid]::NewGuid().ToString('N') + '.ps1'); " ^
  "[IO.File]::WriteAllText($tempScript, $script, [Text.UTF8Encoding]::new($false)); " ^
@@ -40,12 +24,12 @@ Add-Type -AssemblyName System.Drawing
 
 $AppName = 'EMA 200 Trades - Local'
 $LauncherFileName = 'Run BackTestingEngine.bat'
-$GithubRepo = '{repo}'
-$ReleaseAssetName = '{release_asset_name}'
+$GithubRepo = 'rishabhhurkat-coder/BacktestingEngine'
+$ReleaseAssetName = 'EMA-200-Trades-Local-package.zip'
 $InstallerSource = $env:INSTALLER_SELF
-$InstallerDir = if ($InstallerSource) {{ Split-Path -Parent $InstallerSource }} else {{ '' }}
-$InstallerDrive = if ($InstallerSource) {{ Split-Path -Qualifier $InstallerSource }} else {{ '' }}
-$TargetRoot = if ($InstallerDrive -and (Test-Path $InstallerDrive)) {{ $InstallerDrive }} elseif (Test-Path 'D:\') {{ 'D:\' }} else {{ $env:SystemDrive + '\' }}
+$InstallerDir = if ($InstallerSource) { Split-Path -Parent $InstallerSource } else { '' }
+$InstallerDrive = if ($InstallerSource) { Split-Path -Qualifier $InstallerSource } else { '' }
+$TargetRoot = if ($InstallerDrive -and (Test-Path $InstallerDrive)) { $InstallerDrive } elseif (Test-Path 'D:\') { 'D:\' } else { $env:SystemDrive + '\' }
 $InstallDir = Join-Path $TargetRoot $AppName
 $DesktopDir = [Environment]::GetFolderPath('Desktop')
 $ShortcutPath = Join-Path $DesktopDir ($AppName + '.lnk')
@@ -94,82 +78,82 @@ $DetailLabel.AutoSize = $true
 $DetailLabel.Location = New-Object System.Drawing.Point(18, 112)
 $Form.Controls.Add($DetailLabel)
 
-function Update-Ui([int]$Percent, [string]$Status, [string]$Detail = '') {{
+function Update-Ui([int]$Percent, [string]$Status, [string]$Detail = '') {
     $Progress.Value = [Math]::Max(0, [Math]::Min(100, $Percent))
     $StatusLabel.Text = $Status
     $DetailLabel.Text = $Detail
     $Form.Refresh()
     [System.Windows.Forms.Application]::DoEvents()
-}}
+}
 
-function Get-PythonCommand {{
+function Get-PythonCommand {
     $candidates = @(
-        @{{ File = 'py'; Args = @('-3.12') }},
-        @{{ File = 'py'; Args = @('-3') }},
-        @{{ File = 'python'; Args = @() }}
+        @{ File = 'py'; Args = @('-3.12') },
+        @{ File = 'py'; Args = @('-3') },
+        @{ File = 'python'; Args = @() }
     )
 
-    foreach ($candidate in $candidates) {{
-        try {{
+    foreach ($candidate in $candidates) {
+        try {
             $null = & $candidate.File @($candidate.Args + @('-c', 'import sys; print(sys.executable)')) 2>$null
             return @($candidate.File) + $candidate.Args
-        }} catch {{}}
-    }}
+        } catch {}
+    }
 
     return $null
-}}
+}
 
-function Ensure-PythonInstalled {{
+function Ensure-PythonInstalled {
     $pythonCmd = Get-PythonCommand
-    if ($pythonCmd) {{
+    if ($pythonCmd) {
         return $pythonCmd
-    }}
+    }
 
-    if (Get-Command winget -ErrorAction SilentlyContinue) {{
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
         Update-Ui 52 'Installing Python...' 'Python 3.12'
         winget install --id Python.Python.3.12 -e --accept-package-agreements --accept-source-agreements | Out-Null
         $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
         $pythonCmd = Get-PythonCommand
-        if ($pythonCmd) {{
+        if ($pythonCmd) {
             return $pythonCmd
-        }}
-    }}
+        }
+    }
 
     throw 'Python 3 was not found. Please install Python 3 and run this installer again.'
-}}
+}
 
-function Get-LatestReleaseAsset {{
+function Get-LatestReleaseAsset {
     Update-Ui 8 'Checking GitHub release...' $GithubRepo
-    $headers = @{{ 'User-Agent' = 'EMA-200-Trades-Local-Installer'; 'Accept' = 'application/vnd.github+json' }}
-    $release = Invoke-RestMethod -Uri ("https://api.github.com/repos/{repo}/releases/latest") -Headers $headers
-    $asset = $release.assets | Where-Object {{ $_.name -eq $ReleaseAssetName }} | Select-Object -First 1
-    if (-not $asset) {{
-        $asset = $release.assets | Where-Object {{ $_.name -like '*.zip' }} | Select-Object -First 1
-    }}
-    if (-not $asset) {{
+    $headers = @{ 'User-Agent' = 'EMA-200-Trades-Local-Installer'; 'Accept' = 'application/vnd.github+json' }
+    $release = Invoke-RestMethod -Uri ("https://api.github.com/repos/rishabhhurkat-coder/BacktestingEngine/releases/latest") -Headers $headers
+    $asset = $release.assets | Where-Object { $_.name -eq $ReleaseAssetName } | Select-Object -First 1
+    if (-not $asset) {
+        $asset = $release.assets | Where-Object { $_.name -like '*.zip' } | Select-Object -First 1
+    }
+    if (-not $asset) {
         throw 'No update package asset was found in the latest GitHub release.'
-    }}
+    }
     return $asset.browser_download_url
-}}
+}
 
-function Get-LocalPackageAsset {{
+function Get-LocalPackageAsset {
     $candidates = @(
-        $(if ($InstallerDir) {{ Join-Path $InstallerDir $ReleaseAssetName }} else {{ $null }}),
+        $(if ($InstallerDir) { Join-Path $InstallerDir $ReleaseAssetName } else { $null }),
         (Join-Path $InstallDir ('dist\' + $ReleaseAssetName)),
         ('D:\EMA 200 Trades - Local\dist\' + $ReleaseAssetName)
-    ) | Where-Object {{ $_ -and (Test-Path $_) }}
+    ) | Where-Object { $_ -and (Test-Path $_) }
 
     return $candidates | Select-Object -First 1
-}}
+}
 
-function Get-FileSha256([string]$PathValue) {{
-    if (-not (Test-Path $PathValue)) {{
+function Get-FileSha256([string]$PathValue) {
+    if (-not (Test-Path $PathValue)) {
         return ''
-    }}
+    }
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $PathValue).Hash.ToLowerInvariant()
-}}
+}
 
-function Download-ReleaseAsset([string]$AssetUrl, [string]$DestinationPath) {{
+function Download-ReleaseAsset([string]$AssetUrl, [string]$DestinationPath) {
     Update-Ui 15 'Downloading package...' $ReleaseAssetName
     $request = [System.Net.HttpWebRequest]::Create($AssetUrl)
     $request.UserAgent = 'EMA-200-Trades-Local-Installer'
@@ -177,75 +161,75 @@ function Download-ReleaseAsset([string]$AssetUrl, [string]$DestinationPath) {{
     $totalBytes = $response.ContentLength
     $stream = $response.GetResponseStream()
     $fileStream = [System.IO.File]::Open($DestinationPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write)
-    try {{
+    try {
         $buffer = New-Object byte[] (262144)
         $readTotal = 0L
-        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {{
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
             $fileStream.Write($buffer, 0, $read)
             $readTotal += $read
-            if ($totalBytes -gt 0) {{
+            if ($totalBytes -gt 0) {
                 $percent = 15 + [int](($readTotal / $totalBytes) * 30)
-                Update-Ui $percent 'Downloading package...' ("{{0}} KB / {{1}} KB" -f [int]($readTotal / 1KB), [int]($totalBytes / 1KB))
-            }}
-        }}
-    }} finally {{
+                Update-Ui $percent 'Downloading package...' ("{0} KB / {1} KB" -f [int]($readTotal / 1KB), [int]($totalBytes / 1KB))
+            }
+        }
+    } finally {
         $fileStream.Dispose()
         $stream.Dispose()
         $response.Dispose()
-    }}
-}}
+    }
+}
 
-function New-DesktopShortcut([string]$InstallDir) {{
+function New-DesktopShortcut([string]$InstallDir) {
     $iconPath = Join-Path $InstallDir 'assets\ema_200_trades_local.ico'
     $targetPath = Join-Path $InstallDir $LauncherFileName
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($ShortcutPath)
     $shortcut.TargetPath = $targetPath
     $shortcut.WorkingDirectory = $InstallDir
-    if (Test-Path $iconPath) {{
+    if (Test-Path $iconPath) {
         $shortcut.IconLocation = "$iconPath,0"
-    }}
+    }
     $shortcut.Save()
-}}
+}
 
-function Sync-PythonDependencies([string[]]$PythonCmd) {{
+function Sync-PythonDependencies([string[]]$PythonCmd) {
     $requirementsPath = Join-Path $InstallDir 'requirements.txt'
-    if (-not (Test-Path $requirementsPath)) {{
+    if (-not (Test-Path $requirementsPath)) {
         return
-    }}
+    }
 
     $venvPython = Join-Path $InstallDir '.venv\Scripts\python.exe'
     $requirementsHash = Get-FileSha256 $requirementsPath
-    $previousHash = if (Test-Path $RequirementsHashPath) {{ Get-Content -LiteralPath $RequirementsHashPath -ErrorAction SilentlyContinue | Select-Object -First 1 }} else {{ '' }}
+    $previousHash = if (Test-Path $RequirementsHashPath) { Get-Content -LiteralPath $RequirementsHashPath -ErrorAction SilentlyContinue | Select-Object -First 1 } else { '' }
 
-    if ((-not (Test-Path $venvPython)) -and $PythonCmd) {{
+    if ((-not (Test-Path $venvPython)) -and $PythonCmd) {
         Update-Ui 68 'Creating virtual environment...' ''
         $pythonArgs = @()
-        if ($PythonCmd.Length -gt 1) {{
+        if ($PythonCmd.Length -gt 1) {
             $pythonArgs = $PythonCmd[1..($PythonCmd.Length - 1)]
-        }}
+        }
         & $PythonCmd[0] @($pythonArgs + @('-m', 'venv', (Join-Path $InstallDir '.venv'))) | Out-Null
-    }}
+    }
 
-    if (-not (Test-Path $venvPython)) {{
+    if (-not (Test-Path $venvPython)) {
         throw 'Virtual environment creation failed.'
-    }}
+    }
 
-    if ($requirementsHash -and $previousHash -and ($requirementsHash -eq $previousHash)) {{
+    if ($requirementsHash -and $previousHash -and ($requirementsHash -eq $previousHash)) {
         Update-Ui 84 'Using existing Python packages...' 'requirements unchanged'
         return
-    }}
+    }
 
     Update-Ui 80 'Installing Python packages...' 'requirements.txt'
     & $venvPython -m pip install --upgrade pip | Out-Null
     & $venvPython -m pip install -r $requirementsPath | Out-Null
-    if ($requirementsHash) {{
+    if ($requirementsHash) {
         Set-Content -LiteralPath $RequirementsHashPath -Value $requirementsHash -Encoding utf8
-    }}
-}}
+    }
+}
 
 $installFailed = $false
-try {{
+try {
     $Form.Show()
     [System.Windows.Forms.Application]::DoEvents()
     Update-Ui 2 'Preparing installer...' $TargetRoot
@@ -253,13 +237,13 @@ try {{
     New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
 
     $localPackage = Get-LocalPackageAsset
-    if ($localPackage) {{
+    if ($localPackage) {
         Update-Ui 15 'Using local package...' (Split-Path -Leaf $localPackage)
         Copy-Item -LiteralPath $localPackage -Destination $ZipPath -Force
-    }} else {{
+    } else {
         $assetUrl = Get-LatestReleaseAsset
         Download-ReleaseAsset -AssetUrl $assetUrl -DestinationPath $ZipPath
-    }}
+    }
     $cacheDir = Join-Path $InstallDir 'dist'
     New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null
     Copy-Item -LiteralPath $ZipPath -Destination (Join-Path $cacheDir $ReleaseAssetName) -Force
@@ -268,14 +252,14 @@ try {{
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     Expand-Archive -Path $ZipPath -DestinationPath $ExtractDir -Force
     $rootEntries = Get-ChildItem -LiteralPath $ExtractDir
-    $sourceDir = if ($rootEntries.Count -eq 1 -and $rootEntries[0].PSIsContainer) {{ $rootEntries[0].FullName }} else {{ $ExtractDir }}
-    Get-ChildItem -LiteralPath $sourceDir | ForEach-Object {{
+    $sourceDir = if ($rootEntries.Count -eq 1 -and $rootEntries[0].PSIsContainer) { $rootEntries[0].FullName } else { $ExtractDir }
+    Get-ChildItem -LiteralPath $sourceDir | ForEach-Object {
         $destinationPath = Join-Path $InstallDir $_.Name
-        if ($_.PSIsContainer -and $_.Name -eq 'Main Folder' -and (Test-Path $destinationPath)) {{
+        if ($_.PSIsContainer -and $_.Name -eq 'Main Folder' -and (Test-Path $destinationPath)) {
             return
-        }}
+        }
         Copy-Item -Path $_.FullName -Destination $destinationPath -Recurse -Force
-    }}
+    }
 
     Update-Ui 58 'Finding Python...' ''
     $pythonCmd = Ensure-PythonInstalled
@@ -287,32 +271,15 @@ try {{
     Update-Ui 100 'Installation complete' $InstallDir
     Start-Sleep -Milliseconds 700
     $runLauncher = Join-Path $InstallDir $LauncherFileName
-    if (Test-Path $runLauncher) {{
+    if (Test-Path $runLauncher) {
         Start-Process -FilePath $runLauncher -WorkingDirectory $InstallDir
-    }}
-}} catch {{
+    }
+} catch {
     $installFailed = $true
     [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Installation failed', [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-}} finally {{
-    if (Test-Path $TempDir) {{
+} finally {
+    if (Test-Path $TempDir) {
         Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
-    }}
+    }
     $Form.Close()
-}}
-"""
-
-
-def main() -> None:
-    payload = load_version_payload()
-    github_config = payload.get("github") if isinstance(payload.get("github"), dict) else {}
-    repo = str(github_config.get("repo") or "").strip()
-    release_asset_name = str(github_config.get("release_asset_name") or "").strip()
-    INSTALLER_PATH.write_text(
-        build_installer_text(repo=repo, release_asset_name=release_asset_name),
-        encoding="utf-8",
-    )
-    print(INSTALLER_PATH)
-
-
-if __name__ == "__main__":
-    main()
+}

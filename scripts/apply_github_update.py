@@ -16,6 +16,7 @@ from tkinter import BOTH, LEFT, RIGHT, X, StringVar, Tk, ttk
 
 
 APP_NAME = "EMA 200 Trades - Local"
+LAUNCHER_FILE_NAME = "Run BackTestingEngine.bat"
 PRESERVE_NAMES = {"Main Folder", ".venv"}
 SHORTCUT_NAME = f"{APP_NAME}.lnk"
 REQUIREMENTS_HASH_FILE = ".requirements.sha256"
@@ -143,7 +144,7 @@ def copy_updated_files(source_dir: Path, target_dir: Path, window: ProgressWindo
 def ensure_shortcut(app_dir: Path) -> None:
     shortcut_path = Path.home() / "Desktop" / SHORTCUT_NAME
     icon_path = app_dir / "assets" / "ema_200_trades_local.ico"
-    target_path = app_dir / "Run EMA 200 Trades - Local.bat"
+    target_path = app_dir / LAUNCHER_FILE_NAME
     shortcut_text = str(shortcut_path).replace("'", "''")
     target_text = str(target_path).replace("'", "''")
     app_dir_text = str(app_dir).replace("'", "''")
@@ -234,7 +235,7 @@ def main() -> int:
 
             window.set_progress(92, "Refreshing shortcut...", SHORTCUT_NAME)
             ensure_shortcut(app_dir)
-            launcher = app_dir / "Run EMA 200 Trades - Local.bat"
+            launcher = app_dir / LAUNCHER_FILE_NAME
             window.set_progress(98, "Restarting app...", launcher.name)
             if launcher.exists():
                 subprocess.Popen(
