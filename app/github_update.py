@@ -11,7 +11,7 @@ from typing import Any
 
 
 VERSION_FILE_NAME = "app_version.json"
-DEFAULT_RELEASE_ASSET_NAME = "EMA 200 Trades - Local-package.zip"
+DEFAULT_RELEASE_ASSET_NAME = "EMA-200-Trades-Local-package.zip"
 
 
 def load_app_version_info(base_dir: Path) -> dict[str, Any]:

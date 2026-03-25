@@ -12,7 +12,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 VERSION_PATH = ROOT / "app_version.json"
-PACKAGE_PATH = ROOT / "dist" / "EMA 200 Trades - Local-package.zip"
+PACKAGE_PATH = ROOT / "dist" / "EMA-200-Trades-Local-package.zip"
 GIT_EXE = Path(r"C:\Program Files\Git\cmd\git.exe")
 BUILD_SCRIPT = ROOT / "scripts" / "build_release_package.py"
 

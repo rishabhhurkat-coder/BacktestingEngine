@@ -9,7 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DIST_DIR = ROOT / "dist"
 VERSION_PATH = ROOT / "app_version.json"
-PACKAGE_NAME = "EMA 200 Trades - Local-package.zip"
+PACKAGE_NAME = "EMA-200-Trades-Local-package.zip"
 EXCLUDE_PARTS = {".venv", "__pycache__", "node_modules", "dist"}
 
 

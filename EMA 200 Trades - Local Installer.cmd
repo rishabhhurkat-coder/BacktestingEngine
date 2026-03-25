@@ -23,7 +23,7 @@ Add-Type -AssemblyName System.Drawing
 
 $AppName = 'EMA 200 Trades - Local'
 $GithubRepo = 'rishabhhurkat-coder/BacktestingEngine'
-$ReleaseAssetName = 'EMA 200 Trades - Local-package.zip'
+$ReleaseAssetName = 'EMA-200-Trades-Local-package.zip'
 $InstallerSource = $env:INSTALLER_SELF
 $InstallerDrive = if ($InstallerSource) { Split-Path -Qualifier $InstallerSource } else { '' }
 $TargetRoot = if ($InstallerDrive -and (Test-Path $InstallerDrive)) { $InstallerDrive } elseif (Test-Path 'D:\') { 'D:\' } else { $env:SystemDrive + '\' }
